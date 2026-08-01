@@ -90,6 +90,8 @@ require_commands() {
   esac
 }
 
+
+
 config_dir() {
   if [ -n "${MMONIT_CONFIG_DIR:-}" ]; then
     printf '%s' "$MMONIT_CONFIG_DIR"
@@ -201,9 +203,73 @@ fetch_csrf_token() {
   fi
 }
 
+fetch_records_all() {
+  endpoint_base=$1
+  out_json=$2
+
+  page_size=200
+  start=0
+  prev_unique=-1
+
+  merged=$(new_temp) || return 1
+  printf '{"records":[]}' > "$merged"
+
+  while :; do
+    page=$(new_temp) || return 1
+    api_request GET "${endpoint_base}?startIndex=${start}&pageSize=${page_size}" > "$page" || return 1
+
+    if ! jq -e '.records | type == "array"' >/dev/null 2>&1 < "$page"; then
+      error "Could not parse paged response: $endpoint_base"
+      return 1
+    fi
+
+    page_count=$(jq '.records | length' "$page")
+    if [ "$page_count" -eq 0 ]; then
+      break
+    fi
+
+    next=$(new_temp) || return 1
+    if ! jq --slurpfile p "$page" '.records += ($p[0].records // [])' "$merged" > "$next"; then
+      error "Could not merge paged response: $endpoint_base"
+      return 1
+    fi
+    cat "$next" > "$merged"
+
+    dedup=$(new_temp) || return 1
+    if ! jq '.records |= unique_by(.id)' "$merged" > "$dedup"; then
+      error "Could not deduplicate records: $endpoint_base"
+      return 1
+    fi
+    cat "$dedup" > "$merged"
+
+    unique_count=$(jq '.records | length' "$merged")
+    total_hint=$(jq -r '.totalRecords // .total // empty' "$page")
+    case "$total_hint" in
+      ''|*[!0-9]*) total_hint="" ;;
+    esac
+
+    if [ -n "$total_hint" ] && [ "$unique_count" -ge "$total_hint" ]; then
+      break
+    fi
+
+    if [ "$unique_count" -le "$prev_unique" ]; then
+      break
+    fi
+    prev_unique=$unique_count
+
+    if [ "$page_count" -lt "$page_size" ]; then
+      break
+    fi
+
+    start=$((start + page_count))
+  done
+
+  cat "$merged" > "$out_json"
+}
+
 fetch_hosts_json() {
   hosts_json_path=$1
-  api_request GET /api/2/admin/hosts/list > "$hosts_json_path" || return 1
+  fetch_records_all /api/2/admin/hosts/list "$hosts_json_path" || return 1
 }
 
 hosts_as_tsv() {
@@ -521,22 +587,27 @@ start_group() {
 
 check_errors() {
   json=$(new_temp) || return 1
-  api_request GET /api/2/status/hosts/list > "$json" || return 1
+  api_request GET '/api/2/reports/events/list?active=1&state=1' > "$json" || return 1
+
   if ! jq -e . >/dev/null 2>&1 < "$json"; then
-    error "Could not parse status hosts response"
+    error "Could not parse events response"
     return 1
   fi
 
-  total=$(jq '.records | length' "$json")
-  failing=$(jq '[.records[]? | select((.led == 0) or (.led == 1))] | length' "$json")
+  active=$(jq -r '.recordsReturned // ((.records // []) | length) // 0' "$json")
+  case "$active" in
+    ''|*[!0-9]*)
+      error "Could not parse active event count"
+      return 1
+      ;;
+  esac
 
   check_rc=0
-  if [ "$failing" -gt 0 ]; then
-    error "$failing/$total hosts have monitoring errors"
-    jq -r '.records[]? | select((.led == 0) or (.led == 1)) | "  - " + (.hostname // ("host-" + ((.id // 0)|tostring)))' "$json"
+  if [ "$active" -gt 0 ]; then
+    error "$active active monitoring alert events"
     check_rc=1
   else
-    success "No host errors ($total checked)."
+    success "No active monitoring alert events."
   fi
 
   if [ "$INVERT_EXIT" = true ]; then
@@ -580,10 +651,10 @@ render_group_selector() {
   width=$(terminal_width)
   sep=$(printf '%*s' "$width" '' | tr ' ' '-')
 
-  printf '\033[H\033[2J'; print_logo
+  printf '\033[H\033[J'; print_logo
   printf '\n%sSelect groups to %s%s\n' "$BOLD" "$mode_label" "$RESET"
-  printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %s/%s search  %sEnter%s run  %sq/Esc%s cancel\n' \
-    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %sA%s select all  %s/%s search  %sEnter%s run  %sq%s cancel  %sEsc%s clear filter\n' \
+    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
   if [ "$filter_mode" = "true" ]; then
     printf '%s SEARCH%s  %s/%s%s_%s  %s(type to filter, Enter/Esc to finish)%s\n' \
       "$YELLOW" "$RESET" "$BOLD" "$filter_query" "$RESET" "$YELLOW" "$DIM" "$RESET"
@@ -624,13 +695,23 @@ render_group_selector() {
     "$CYAN" "$RESET" "$BOLD" "$chosen_count" "$RESET" "$total" "$CYAN" "$RESET" "$visible_total"
 }
 
+read_optional_key_byte() {
+  old_seq_stty=$(stty -g < /dev/tty 2>/dev/null || true)
+  stty min 0 time 1 < /dev/tty 2>/dev/null || true
+  b=$(dd bs=1 count=1 2>/dev/null < /dev/tty || true)
+  if [ -n "$old_seq_stty" ]; then
+    stty "$old_seq_stty" < /dev/tty 2>/dev/null || true
+  fi
+  printf '%s' "$b"
+}
+
 read_key() {
   KEY_TEXT=""
   key=$(dd bs=1 count=1 2>/dev/null < /dev/tty) || return 1
   if [ "$key" = "$(printf '\033')" ]; then
-    second=$(dd bs=1 count=1 2>/dev/null < /dev/tty || true)
+    second=$(read_optional_key_byte)
     if [ "$second" = "[" ]; then
-      third=$(dd bs=1 count=1 2>/dev/null < /dev/tty || true)
+      third=$(read_optional_key_byte)
       case "$third" in A) KEY=up ;; B) KEY=down ;; *) KEY=escape ;; esac
     else
       KEY=escape
@@ -650,7 +731,9 @@ read_key() {
   elif [ -z "$key" ]; then
     KEY=enter
   elif [ "$key" = q ]; then
-    KEY=escape
+    KEY=quit
+  elif [ "$key" = A ]; then
+    KEY=all
   else
     KEY=char
     KEY_TEXT=$key
@@ -666,6 +749,13 @@ toggle_selection() {
   else
     printf '%s\n' "$token" >> "$selected_file"
   fi
+}
+
+select_all_visible() {
+  visible_file=$1; selected_file=$2
+  next=$(new_temp) || return 1
+  awk -F '\t' 'NF > 0 { print $1 }' "$visible_file" > "$next"
+  cat "$next" > "$selected_file"
 }
 
 select_groups() {
@@ -690,8 +780,17 @@ select_groups() {
 
     if [ "$filter_mode" = "true" ]; then
       case "$KEY" in
-        enter|escape)
+        enter)
           filter_mode=false
+          ;;
+        escape)
+          filter_mode=false
+          filter_query=""
+          build_filtered_groups "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
           ;;
         backspace)
           filter_query=${filter_query%?}
@@ -703,6 +802,14 @@ select_groups() {
           ;;
         space|char|filter)
           filter_query="$filter_query$KEY_TEXT"
+          build_filtered_groups "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+          ;;
+        quit)
+          filter_query="${filter_query}q"
           build_filtered_groups "$source_file" "$filter_query" "$visible"
           total=$(awk 'END { print NR + 0 }' "$visible")
           if [ "$total" -eq 0 ]; then cursor=1
@@ -728,6 +835,12 @@ select_groups() {
         if [ "$total" -gt 0 ]; then
           gid=$(awk -F '\t' -v line="$cursor" 'NR == line { print $1 }' "$visible")
           toggle_selection "$gid" "$selected" || { stty "$old_stty" < /dev/tty; return 1; }
+          if [ "$cursor" -lt "$total" ]; then cursor=$((cursor + 1)); else cursor=1; fi
+        fi
+        ;;
+      all)
+        if [ "$total" -gt 0 ]; then
+          select_all_visible "$visible" "$selected" || { stty "$old_stty" < /dev/tty; return 1; }
         fi
         ;;
       filter)
@@ -737,14 +850,24 @@ select_groups() {
         if [ -s "$selected" ]; then break; fi
         ;;
       escape)
+        if [ -n "$filter_query" ]; then
+          filter_query=""
+          build_filtered_groups "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+        fi
+        ;;
+      quit)
         stty "$old_stty" < /dev/tty
-        printf '\033[H\033[2J' > /dev/tty
+        printf '\033[H\033[J' > /dev/tty
         return 2
         ;;
     esac
   done
   stty "$old_stty" < /dev/tty
-  printf '\033[H\033[2J' > /dev/tty
+  printf '\033[H\033[J' > /dev/tty
   cat "$selected" > "$output"
 }
 
@@ -825,10 +948,10 @@ render_host_selector() {
   width=$(terminal_width)
   sep=$(printf '%*s' "$width" '' | tr ' ' '-')
 
-  printf '\033[H\033[2J'; print_logo
+  printf '\033[H\033[J'; print_logo
   printf '\n%sSelect hosts to %s%s\n' "$BOLD" "$mode_label" "$RESET"
-  printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %s/%s search  %sEnter%s run  %sq/Esc%s cancel\n' \
-    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %sA%s select all  %s/%s search  %sEnter%s run  %sq%s cancel  %sEsc%s clear filter\n' \
+    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
   if [ "$filter_mode" = "true" ]; then
     printf '%s SEARCH%s  %s/%s%s_%s  %s(type to filter, Enter/Esc to finish)%s\n' \
       "$YELLOW" "$RESET" "$BOLD" "$filter_query" "$RESET" "$YELLOW" "$DIM" "$RESET"
@@ -846,7 +969,7 @@ render_host_selector() {
     }
     BEGIN {
       while ((getline line < selected) > 0) chosen[line]=1
-      name_w = width - 22
+      name_w = width - 35
       if (name_w < 18) name_w = 18
     }
     {
@@ -856,11 +979,10 @@ render_host_selector() {
       status = $3
 
       if (NR == cursor) {
-        printf "%s %s %s%s%s  %s[%s]%s\n", pointer, marker, bold, name, reset, dim, status, reset
+        printf "%s %s %s%s%s  %s[%s]%s  %shost id:%s %s%s\n", pointer, marker, bold, name, reset, dim, status, reset, dim, reset, dim, $1, reset
       } else {
-        printf "%s %s %s  %s[%s]%s\n", pointer, marker, name, dim, status, reset
+        printf "%s %s %s  %s[%s]%s  %shost id:%s %s%s\n", pointer, marker, name, dim, status, reset, dim, reset, dim, $1, reset
       }
-      printf "    %shost id:%s %s%s%s\n", dim, reset, dim, $1, reset
     }' "$file"
 
   chosen_count=$(awk 'END { print NR + 0 }' "$selected_file")
@@ -891,8 +1013,17 @@ select_hosts() {
 
     if [ "$filter_mode" = "true" ]; then
       case "$KEY" in
-        enter|escape)
+        enter)
           filter_mode=false
+          ;;
+        escape)
+          filter_mode=false
+          filter_query=""
+          build_filtered_hosts "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
           ;;
         backspace)
           filter_query=${filter_query%?}
@@ -904,6 +1035,14 @@ select_hosts() {
           ;;
         space|char|filter)
           filter_query="$filter_query$KEY_TEXT"
+          build_filtered_hosts "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+          ;;
+        quit)
+          filter_query="${filter_query}q"
           build_filtered_hosts "$source_file" "$filter_query" "$visible"
           total=$(awk 'END { print NR + 0 }' "$visible")
           if [ "$total" -eq 0 ]; then cursor=1
@@ -929,6 +1068,12 @@ select_hosts() {
         if [ "$total" -gt 0 ]; then
           hid=$(awk -F '\t' -v line="$cursor" 'NR == line { print $1 }' "$visible")
           toggle_selection "$hid" "$selected" || { stty "$old_stty" < /dev/tty; return 1; }
+          if [ "$cursor" -lt "$total" ]; then cursor=$((cursor + 1)); else cursor=1; fi
+        fi
+        ;;
+      all)
+        if [ "$total" -gt 0 ]; then
+          select_all_visible "$visible" "$selected" || { stty "$old_stty" < /dev/tty; return 1; }
         fi
         ;;
       filter)
@@ -938,14 +1083,24 @@ select_hosts() {
         if [ -s "$selected" ]; then break; fi
         ;;
       escape)
+        if [ -n "$filter_query" ]; then
+          filter_query=""
+          build_filtered_hosts "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+        fi
+        ;;
+      quit)
         stty "$old_stty" < /dev/tty
-        printf '\033[H\033[2J' > /dev/tty
+        printf '\033[H\033[J' > /dev/tty
         return 2
         ;;
     esac
   done
   stty "$old_stty" < /dev/tty
-  printf '\033[H\033[2J' > /dev/tty
+  printf '\033[H\033[J' > /dev/tty
   cat "$selected" > "$output"
 }
 
@@ -1176,6 +1331,11 @@ main() {
       ;;
     check)
       check_errors
+      ;;
+    *)
+      usage
+      error "Unknown command: $command"
+      return 1
       ;;
   esac
 }

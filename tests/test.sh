@@ -70,14 +70,14 @@ case "$url" in
   *"/api/2/session/get")
     body='{"CSRFToken":"token-123"}'
     ;;
-  *"/api/2/status/hosts/list")
+  *"/api/2/reports/events/list?active=1&state=1")
     if [ "${MOCK_CHECK_FAIL:-0}" = "1" ]; then
-      body='{"records":[{"id":1,"hostname":"host-a","led":2},{"id":2,"hostname":"host-b","led":0}],"recordsReturned":2}'
+      body='{"records":[{"id":1001}],"recordsReturned":1}'
     else
-      body='{"records":[{"id":1,"hostname":"host-a","led":2},{"id":2,"hostname":"host-b","led":2}],"recordsReturned":2}'
+      body='{"records":[],"recordsReturned":0}'
     fi
     ;;
-  *"/api/2/admin/hosts/list")
+  *"/api/2/admin/hosts/list"*)
     body='{"totalRecords":3,"records":[{"id":1,"hostname":"host-a","status":"Active"},{"id":2,"hostname":"host-b","status":"Active"},{"id":3,"hostname":"host-c","status":"Inactive"}]}'
     ;;
   *"/api/2/admin/groups/list")
@@ -152,7 +152,7 @@ grep -F 'id=3' "$MOCK_LOG" >/dev/null || fail "start-group should only update ho
 grep -F 'status=0' "$MOCK_LOG" >/dev/null || fail "start-group did not set status=0"
 
 output=$("$ROOT/bin/mmonitctl" check)
-printf '%s' "$output" | grep -F 'No host errors (2 checked).' >/dev/null || fail "check output"
+printf '%s' "$output" | grep -F 'No active monitoring alert events.' >/dev/null || fail "check output"
 
 if MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" check >/dev/null 2>&1; then
   fail "check should fail when host is red/orange"
