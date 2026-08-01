@@ -1,0 +1,1183 @@
+#!/bin/sh
+
+set -u
+
+VERSION="0.1.0"
+CONCURRENCY="${MMONIT_CONCURRENCY:-8}"
+ASSUME_YES=false
+INVERT_EXIT=false
+TMP_FILES=""
+CSRF_TOKEN=""
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  RESET=$(printf '\033[0m'); BOLD=$(printf '\033[1m'); DIM=$(printf '\033[2m')
+  RED=$(printf '\033[31m'); GREEN=$(printf '\033[32m'); YELLOW=$(printf '\033[33m')
+  CYAN=$(printf '\033[36m')
+else
+  RESET="" BOLD="" DIM="" RED="" GREEN="" YELLOW="" CYAN=""
+fi
+
+say() { printf '%s\n' "$*"; }
+error() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; }
+success() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+info() { printf '%s›%s %s\n' "$CYAN" "$RESET" "$*"; }
+print_logo() { printf '%s%s◆ M/Monit%s  %shost monitor control%s\n' "$BOLD" "$GREEN" "$RESET" "$DIM" "$RESET"; }
+
+cleanup() {
+  if [ -n "$TMP_FILES" ]; then
+    # shellcheck disable=SC2086
+    rm -rf $TMP_FILES
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+new_temp() {
+  file=$(mktemp "${TMPDIR:-/tmp}/mmonitctl.XXXXXX") || return 1
+  TMP_FILES="$TMP_FILES $file"
+  printf '%s' "$file"
+}
+
+normalize_base_url() {
+  while [ "${BASE_URL%/}" != "$BASE_URL" ]; do
+    BASE_URL=${BASE_URL%/}
+  done
+}
+
+
+
+usage() {
+  cat <<'EOF'
+mmonitctl - control M/Monit host monitoring state
+
+Usage:
+  mmonitctl                               Open the action menu
+  mmonitctl stop-all [--yes]              Stop all hosts (status=2: Ignored)
+  mmonitctl start-all [--yes]             Start all hosts (status=0: Active)
+  mmonitctl stop [--yes]                  Select hosts to stop (interactive)
+  mmonitctl start [--yes]                 Select hosts to start (interactive)
+  mmonitctl stop-group <group> [--yes]    Stop hosts in group
+  mmonitctl start-group <group> [--yes]   Start hosts in group
+  mmonitctl check                         Exit 1 if any host has errors, else 0
+  mmonitctl config                        Configure credentials
+  mmonitctl version                       Print version
+
+Options:
+  -y, --yes, --non-interactive           Compatibility flag (accepted)
+  --invert-exit                          Invert exit status for check (error=0, ok=1)
+  -h, --help                             Show this help
+
+Environment:
+  MMONIT_BASE_URL                        M/Monit base URL (e.g. https://mmonit.example.com:8443)
+  MMONIT_USERNAME                        M/Monit username
+  MMONIT_PASSWORD                        M/Monit password
+  MMONIT_CONFIG_DIR                      Override config directory
+  MMONIT_CONCURRENCY                     Parallel worker count (default: 8)
+  NO_COLOR                               Disable ANSI colors
+EOF
+}
+
+require_commands() {
+  missing=""
+  for command_name in curl jq awk mktemp stty; do
+    command -v "$command_name" >/dev/null 2>&1 || missing="$missing $command_name"
+  done
+  if [ -n "$missing" ]; then
+    error "Missing required commands:$missing"
+    return 1
+  fi
+  case "$CONCURRENCY" in
+    ''|*[!0-9]*|0) error "MMONIT_CONCURRENCY must be a positive integer"; return 1 ;;
+  esac
+}
+
+config_dir() {
+  if [ -n "${MMONIT_CONFIG_DIR:-}" ]; then
+    printf '%s' "$MMONIT_CONFIG_DIR"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    printf '%s' "$HOME/Library/Application Support/mmonitctl"
+  else
+    printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/mmonitctl"
+  fi
+}
+
+config_path() { printf '%s/config.json' "$(config_dir)"; }
+
+load_config() {
+  cfg=$(config_path)
+
+  BASE_URL="${MMONIT_BASE_URL:-}"
+  USERNAME="${MMONIT_USERNAME:-}"
+  PASSWORD="${MMONIT_PASSWORD:-}"
+
+  if [ -r "$cfg" ]; then
+    [ -n "$BASE_URL" ] || BASE_URL=$(jq -r '.base_url // empty' "$cfg" 2>/dev/null || printf '')
+    [ -n "$USERNAME" ] || USERNAME=$(jq -r '.username // empty' "$cfg" 2>/dev/null || printf '')
+    [ -n "$PASSWORD" ] || PASSWORD=$(jq -r '.password // empty' "$cfg" 2>/dev/null || printf '')
+  fi
+
+  [ -n "$BASE_URL" ] || return 1
+  [ -n "$USERNAME" ] || return 1
+  [ -n "$PASSWORD" ] || return 1
+
+  normalize_base_url
+}
+
+setup() {
+  force=${1:-false}
+  print_logo; say ""
+  if [ "$force" = "true" ]; then
+    info "Reconfigure M/Monit credentials"
+  else
+    printf '%sInitial setup%s\n' "$BOLD" "$RESET"
+  fi
+
+  printf 'M/Monit base URL (e.g. https://127.0.0.1:8443): '
+  IFS= read -r BASE_URL || true
+  while [ "${BASE_URL%/}" != "$BASE_URL" ]; do BASE_URL=${BASE_URL%/}; done
+  if [ -z "$BASE_URL" ]; then error "Base URL cannot be empty"; return 1; fi
+
+  printf 'Username: '
+  IFS= read -r USERNAME || true
+  if [ -z "$USERNAME" ]; then error "Username cannot be empty"; return 1; fi
+
+  printf 'Password: '
+  old_stty=""
+  if [ -t 0 ]; then old_stty=$(stty -g); stty -echo; fi
+  IFS= read -r PASSWORD || true
+  if [ -n "$old_stty" ]; then stty "$old_stty"; fi
+  printf '\n'
+  if [ -z "$PASSWORD" ]; then error "Password cannot be empty"; return 1; fi
+
+  dir=$(config_dir)
+  cfg=$(config_path)
+  payload=$(jq -n --arg base_url "$BASE_URL" --arg username "$USERNAME" --arg password "$PASSWORD" \
+    '{base_url:$base_url, username:$username, password:$password}') || return 1
+
+  if ! (umask 077 && mkdir -p "$dir" && printf '%s\n' "$payload" > "$cfg"); then
+    error "Could not save configuration: $cfg"
+    return 1
+  fi
+  chmod 700 "$dir" 2>/dev/null || true
+  chmod 600 "$cfg" 2>/dev/null || true
+  success "Configuration saved"
+  printf '%s  %s%s\n' "$DIM" "$cfg" "$RESET"
+}
+
+api_request() {
+  method=$1
+  endpoint=$2
+  shift 2
+  response=$(new_temp) || return 1
+
+  status=$(curl --silent --show-error --compressed \
+    --output "$response" --write-out '%{http_code}' \
+    --request "$method" \
+    --user "$USERNAME:$PASSWORD" \
+    "$@" \
+    "$BASE_URL$endpoint")
+  curl_status=$?
+  if [ "$curl_status" -ne 0 ]; then
+    error "Could not connect to M/Monit API"
+    return 1
+  fi
+
+  case "$status" in
+    2??) cat "$response" ;;
+    *)
+      message=$(jq -r 'if type == "object" then (.error // .message // tostring) else tostring end' "$response" 2>/dev/null || printf 'API request failed')
+      error "M/Monit API: $message ($status)"
+      return 1
+      ;;
+  esac
+}
+
+fetch_csrf_token() {
+  json=$(new_temp) || return 1
+  api_request GET /api/2/session/get > "$json" || return 1
+  CSRF_TOKEN=$(jq -r '.CSRFToken // empty' "$json")
+  if [ -z "$CSRF_TOKEN" ]; then
+    error "Could not get CSRF token from /api/2/session/get"
+    return 1
+  fi
+}
+
+fetch_hosts_json() {
+  hosts_json_path=$1
+  api_request GET /api/2/admin/hosts/list > "$hosts_json_path" || return 1
+}
+
+hosts_as_tsv() {
+  jq -r '
+    .records[]?
+    | [.id,
+       ((.hostname // "") | gsub("[\\t\\r\\n]"; " ")),
+       ((.status // "") | gsub("[\\t\\r\\n]"; " "))]
+    | @tsv'
+}
+
+hosts_as_tsv_for_action() {
+  target_status=$1
+  case "$target_status" in
+    2)
+      jq -r '
+        .records[]?
+        | select(((.status // "") | ascii_downcase) != "ignored")
+        | [.id,
+           ((.hostname // "") | gsub("[\\t\\r\\n]"; " ")),
+           ((.status // "") | gsub("[\\t\\r\\n]"; " "))]
+        | @tsv'
+      ;;
+    0)
+      jq -r '
+        .records[]?
+        | select(((.status // "") | ascii_downcase) != "active")
+        | [.id,
+           ((.hostname // "") | gsub("[\\t\\r\\n]"; " ")),
+           ((.status // "") | gsub("[\\t\\r\\n]"; " "))]
+        | @tsv'
+      ;;
+    *)
+      hosts_as_tsv
+      ;;
+  esac
+}
+
+hosts_list_to_file() {
+  hosts_out=$1
+  hosts_json_tmp=$(new_temp) || return 1
+  fetch_hosts_json "$hosts_json_tmp" || return 1
+  if ! jq -r '.records[]? | [.id, .hostname] | @tsv' "$hosts_json_tmp" > "$hosts_out"; then
+    error "Could not parse hosts list"
+    return 1
+  fi
+}
+
+fetch_groups_json() {
+  groups_json_path=$1
+  api_request GET /api/2/admin/groups/list > "$groups_json_path" || return 1
+}
+
+groups_as_tsv() {
+  jq -r '
+    .groups[]?
+    | [.id,
+       ((.name // "") | gsub("[\\t\\r\\n]"; " ")),
+       ((.hosts // []) | length)]
+    | @tsv'
+}
+
+groups_as_tsv_for_action() {
+  target_status=$1
+  groups_json=$2
+  hosts_json=$3
+
+  if ! jq -r --arg target "$target_status" --slurpfile hosts "$hosts_json" '
+    def norm: (.|tostring|ascii_downcase);
+    def host_status_map:
+      ($hosts[0].records // [])
+      | map({key:(.id|tostring), value:((.status // "")|norm)})
+      | from_entries;
+
+    . as $root
+    | host_status_map as $status_map
+    | .groups[]?
+    | [(.hosts[]? | if type == "object" then .id else . end)] as $ids
+    | ($ids | unique) as $uids
+    | ($uids | length) as $count
+    | ($uids | map(($status_map[(.|tostring)] // ""))) as $statuses
+    | (
+        if $target == "2" then
+          ($count > 0 and any($statuses[]?; . != "ignored"))
+        elif $target == "0" then
+          ($count > 0 and all($statuses[]?; . == "ignored"))
+        else
+          true
+        end
+      ) as $selectable
+    | select($selectable)
+    | [.id,
+       ((.name // "") | gsub("[\\t\\r\\n]"; " ")),
+       $count]
+    | @tsv
+  ' "$groups_json"; then
+    error "Could not parse group list"
+    return 1
+  fi
+}
+
+group_hosts_from_json_to_file() {
+  group=$1
+  json=$2
+  out=$3
+
+  if [ "$group" = "ALL" ] || [ "$group" = "all" ]; then
+    if ! jq -r '
+      . as $root
+      | [(.groups[]?.hosts[]? | if type == "object" then .id else . end)] | unique[]? as $hid
+      | [$hid, (($root.hosts[]? | select(.id == $hid) | .name) // ("host-" + ($hid|tostring)))]
+      | @tsv
+    ' "$json" > "$out"; then
+      error "Could not parse group list"
+      return 1
+    fi
+    return 0
+  fi
+
+  group_id=$(jq -r --arg group "$group" '
+    [
+      .groups[]?
+      | select((.id|tostring) == $group or .name == $group or ((.name // "") | ascii_downcase) == ($group | ascii_downcase))
+    ][0].id // empty
+  ' "$json")
+  if [ -z "$group_id" ]; then
+    error "Group not found: $group"
+    return 1
+  fi
+
+  if ! jq -r --argjson gid "$group_id" '
+    . as $root
+    | [([.groups[]? | select(.id == $gid)][0].hosts[]? | if type == "object" then .id else . end)] | unique[]? as $hid
+    | [$hid, (($root.hosts[]? | select(.id == $hid) | .name) // ("host-" + ($hid|tostring)))]
+    | @tsv
+  ' "$json" > "$out"; then
+    error "Could not parse group list"
+    return 1
+  fi
+}
+
+group_hosts_to_file() {
+  group=$1
+  hosts_out=$2
+  groups_json_tmp=$(new_temp) || return 1
+  fetch_groups_json "$groups_json_tmp" || return 1
+  group_hosts_from_json_to_file "$group" "$groups_json_tmp" "$hosts_out"
+}
+
+update_host_status() {
+  id=$1
+  hostname=$2
+  monituser=$3
+  monitpassword=$4
+  ipaddrout=$5
+  portout=$6
+  keepname=$7
+  target_status=$8
+  skew=$9
+  description=${10}
+
+  api_request POST /api/2/admin/hosts/update \
+    --header "X-CSRF-Token: $CSRF_TOKEN" \
+    --header "CSRFToken: $CSRF_TOKEN" \
+    --data-urlencode "id=$id" \
+    --data-urlencode "hostname=$hostname" \
+    --data-urlencode "monituser=$monituser" \
+    --data-urlencode "monitpassword=$monitpassword" \
+    --data-urlencode "ipaddrout=$ipaddrout" \
+    --data-urlencode "portout=$portout" \
+    --data-urlencode "keepname=$keepname" \
+    --data-urlencode "status=$target_status" \
+    --data-urlencode "skew=$skew" \
+    --data-urlencode "description=$description" >/dev/null
+}
+
+run_host_job() {
+  id=$1
+  target_status=$2
+  result_dir=$3
+  index=$4
+  label=$5
+
+  details=$(new_temp) || return 1
+  if ! api_request GET "/api/2/admin/hosts/get?id=$id" > "$details"; then
+    printf '%s\t%s\t%s\n' "$index" failed "$label" > "$result_dir/$index"
+    return 0
+  fi
+
+  hostname=$(jq -r '.hostname // empty' "$details")
+  monituser=$(jq -r '.monituser // empty' "$details")
+  monitpassword=$(jq -r '.monitpassword // empty' "$details")
+  ipaddrout=$(jq -r '.ipaddrout // ""' "$details")
+  portout=$(jq -r 'if .portout == null then -1 else .portout end' "$details")
+  keepname=$(jq -r 'if .keepname == null then 0 else .keepname end' "$details")
+  skew=$(jq -r 'if .skew == null then 3 else .skew end' "$details")
+  description=$(jq -r '.description // ""' "$details")
+  current_status=$(jq -r '.status // empty' "$details")
+
+  if [ -z "$hostname" ] || [ -z "$monituser" ] || [ -z "$monitpassword" ]; then
+    printf '%s\t%s\t%s\n' "$index" failed "$label" > "$result_dir/$index"
+    return 0
+  fi
+
+  display_name=$hostname
+  [ -n "$display_name" ] || display_name=$label
+
+  if [ "$current_status" = "$target_status" ]; then
+    printf '%s\t%s\t%s\n' "$index" skipped "$display_name" > "$result_dir/$index"
+    return 0
+  fi
+
+  if update_host_status "$id" "$hostname" "$monituser" "$monitpassword" "$ipaddrout" "$portout" "$keepname" "$target_status" "$skew" "$description"; then
+    printf '%s\t%s\t%s\n' "$index" ok "$display_name" > "$result_dir/$index"
+  else
+    printf '%s\t%s\t%s\n' "$index" failed "$display_name" > "$result_dir/$index"
+  fi
+}
+
+bulk_update_from_file() {
+  file=$1
+  target_status=$2
+  action_label=$3
+
+  count=$(awk 'END { print NR + 0 }' "$file")
+  if [ "$count" -eq 0 ]; then
+    info "No hosts matched."
+    return 0
+  fi
+
+  result_dir=$(new_temp) || return 1
+  rm -f "$result_dir"
+  mkdir "$result_dir" || return 1
+
+  printf '%s%s●%s  %s %d hosts in parallel %s%s(workers: %s)%s\n\n' \
+    "$BOLD" "$CYAN" "$RESET" "$action_label" "$count" "$RESET" "$DIM" "$CONCURRENCY" "$RESET"
+
+  running=0
+  index=0
+  tab=$(printf '\t')
+  while IFS="$tab" read -r id hostname; do
+    [ -n "$id" ] || continue
+    index=$((index + 1))
+    run_host_job "$id" "$target_status" "$result_dir" "$index" "$hostname" &
+    running=$((running + 1))
+    if [ "$running" -ge "$CONCURRENCY" ]; then
+      wait
+      running=0
+    fi
+  done < "$file"
+  wait
+
+  failures=0
+  changed=0
+  skipped=0
+  i=1
+  while [ "$i" -le "$count" ]; do
+    if [ ! -r "$result_dir/$i" ]; then
+      printf '  %s[%d/%d]%s %sunknown result%s\n' "$DIM" "$i" "$count" "$RED" "$RESET"
+      failures=$((failures + 1))
+    else
+      tab=$(printf '\t')
+      IFS="$tab" read -r row status name < "$result_dir/$i"
+      case "$status" in
+        ok)
+          changed=$((changed + 1))
+          printf '  %s[%d/%d]%s %-36s %supdated%s\n' "$DIM" "$i" "$count" "$RESET" "$name" "$GREEN" "$RESET"
+          ;;
+        skipped)
+          skipped=$((skipped + 1))
+          printf '  %s[%d/%d]%s %-36s %sskip%s\n' "$DIM" "$i" "$count" "$RESET" "$name" "$YELLOW" "$RESET"
+          ;;
+        *)
+          failures=$((failures + 1))
+          printf '  %s[%d/%d]%s %-36s %sfailed%s\n' "$DIM" "$i" "$count" "$RESET" "$name" "$RED" "$RESET"
+          ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+
+  say ""
+  success "$changed hosts updated, $skipped skipped."
+  if [ "$failures" -ne 0 ]; then
+    error "$failures/$count hosts failed"
+    return 1
+  fi
+}
+
+stop_all() {
+  file=$(new_temp) || return 1
+  hosts_list_to_file "$file" || return 1
+  bulk_update_from_file "$file" 2 "Stop"
+}
+
+start_all() {
+  file=$(new_temp) || return 1
+  hosts_list_to_file "$file" || return 1
+  bulk_update_from_file "$file" 0 "Start"
+}
+
+stop_group() {
+  group=$1
+  file=$(new_temp) || return 1
+  group_hosts_to_file "$group" "$file" || return 1
+  bulk_update_from_file "$file" 2 "Stop"
+}
+
+start_group() {
+  group=$1
+  file=$(new_temp) || return 1
+  group_hosts_to_file "$group" "$file" || return 1
+  bulk_update_from_file "$file" 0 "Start"
+}
+
+check_errors() {
+  json=$(new_temp) || return 1
+  api_request GET /api/2/status/hosts/list > "$json" || return 1
+  if ! jq -e . >/dev/null 2>&1 < "$json"; then
+    error "Could not parse status hosts response"
+    return 1
+  fi
+
+  total=$(jq '.records | length' "$json")
+  failing=$(jq '[.records[]? | select((.led == 0) or (.led == 1))] | length' "$json")
+
+  check_rc=0
+  if [ "$failing" -gt 0 ]; then
+    error "$failing/$total hosts have monitoring errors"
+    jq -r '.records[]? | select((.led == 0) or (.led == 1)) | "  - " + (.hostname // ("host-" + ((.id // 0)|tostring)))' "$json"
+    check_rc=1
+  else
+    success "No host errors ($total checked)."
+  fi
+
+  if [ "$INVERT_EXIT" = true ]; then
+    if [ "$check_rc" -eq 0 ]; then
+      return 1
+    fi
+    return 0
+  fi
+
+  return "$check_rc"
+}
+
+terminal_width() {
+  if [ -r /dev/tty ]; then
+    size=$(stty size < /dev/tty 2>/dev/null || true)
+    cols=$(printf '%s' "$size" | awk '{ print $2 }')
+    case "$cols" in ''|*[!0-9]*) cols=100 ;; esac
+    if [ "$cols" -lt 60 ]; then cols=60; fi
+    printf '%s' "$cols"
+  else
+    printf '100'
+  fi
+}
+
+build_filtered_groups() {
+  source_file=$1; query=$2; out_file=$3
+  if [ -z "$query" ]; then
+    cat "$source_file" > "$out_file"
+    return
+  fi
+  awk -F '\t' -v q="$query" '
+    BEGIN { ql = tolower(q) }
+    {
+      hay = tolower($1 " " $2)
+      if (index(hay, ql) > 0) print
+    }' "$source_file" > "$out_file"
+}
+
+render_group_selector() {
+  file=$1; selected_file=$2; cursor=$3; total=$4; filter_query=$5; filter_mode=$6; visible_total=$7; mode_label=$8
+  width=$(terminal_width)
+  sep=$(printf '%*s' "$width" '' | tr ' ' '-')
+
+  printf '\033[H\033[2J'; print_logo
+  printf '\n%sSelect groups to %s%s\n' "$BOLD" "$mode_label" "$RESET"
+  printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %s/%s search  %sEnter%s run  %sq/Esc%s cancel\n' \
+    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  if [ "$filter_mode" = "true" ]; then
+    printf '%s SEARCH%s  %s/%s%s_%s  %s(type to filter, Enter/Esc to finish)%s\n' \
+      "$YELLOW" "$RESET" "$BOLD" "$filter_query" "$RESET" "$YELLOW" "$DIM" "$RESET"
+  elif [ -n "$filter_query" ]; then
+    printf '%s Filter:%s %s%s%s  %s(press / to edit)%s\n' "$YELLOW" "$RESET" "$BOLD" "$filter_query" "$RESET" "$DIM" "$RESET"
+  fi
+  printf '%s%s%s\n' "$DIM" "$sep" "$RESET"
+
+  awk -F '\t' -v cursor="$cursor" -v selected="$selected_file" -v width="$width" \
+    -v cyan="$CYAN" -v green="$GREEN" -v dim="$DIM" -v bold="$BOLD" -v reset="$RESET" '
+    function clip(s, n) {
+      if (n < 2) return s
+      if (length(s) <= n) return s
+      return substr(s, 1, n - 1) "…"
+    }
+    BEGIN {
+      while ((getline line < selected) > 0) chosen[line]=1
+      name_w = width - 24
+      if (name_w < 18) name_w = 18
+    }
+    {
+      marker = chosen[$1] ? green "●" reset : dim "○" reset
+      pointer = (NR == cursor) ? cyan "❯" reset : " "
+      name = clip($2, name_w)
+      count = $3 + 0
+
+      if (NR == cursor) {
+        printf "%s %s %s%s%s  %s(%d hosts)%s\n", pointer, marker, bold, name, reset, dim, count, reset
+      } else {
+        printf "%s %s %s  %s(%d hosts)%s\n", pointer, marker, name, dim, count, reset
+      }
+      printf "    %sgroup id:%s %s%s%s\n", dim, reset, dim, $1, reset
+    }' "$file"
+
+  chosen_count=$(awk 'END { print NR + 0 }' "$selected_file")
+  printf '%s%s%s\n' "$DIM" "$sep" "$RESET"
+  printf '%s Selected %s%s %d%s / %d groups   %sMatches%s %d\n' \
+    "$CYAN" "$RESET" "$BOLD" "$chosen_count" "$RESET" "$total" "$CYAN" "$RESET" "$visible_total"
+}
+
+read_key() {
+  KEY_TEXT=""
+  key=$(dd bs=1 count=1 2>/dev/null < /dev/tty) || return 1
+  if [ "$key" = "$(printf '\033')" ]; then
+    second=$(dd bs=1 count=1 2>/dev/null < /dev/tty || true)
+    if [ "$second" = "[" ]; then
+      third=$(dd bs=1 count=1 2>/dev/null < /dev/tty || true)
+      case "$third" in A) KEY=up ;; B) KEY=down ;; *) KEY=escape ;; esac
+    else
+      KEY=escape
+    fi
+  elif [ "$key" = "$(printf '\020')" ] || [ "$key" = k ]; then
+    KEY=up
+  elif [ "$key" = "$(printf '\016')" ] || [ "$key" = j ]; then
+    KEY=down
+  elif [ "$key" = "$(printf '\177')" ] || [ "$key" = "$(printf '\010')" ]; then
+    KEY=backspace
+  elif [ "$key" = " " ]; then
+    KEY=space
+    KEY_TEXT=" "
+  elif [ "$key" = / ]; then
+    KEY=filter
+    KEY_TEXT="/"
+  elif [ -z "$key" ]; then
+    KEY=enter
+  elif [ "$key" = q ]; then
+    KEY=escape
+  else
+    KEY=char
+    KEY_TEXT=$key
+  fi
+}
+
+toggle_selection() {
+  token=$1; selected_file=$2
+  if grep -F -x "$token" "$selected_file" >/dev/null 2>&1; then
+    next=$(new_temp) || return 1
+    grep -F -x -v "$token" "$selected_file" > "$next" || true
+    cat "$next" > "$selected_file"
+  else
+    printf '%s\n' "$token" >> "$selected_file"
+  fi
+}
+
+select_groups() {
+  source_file=$1; output=$2; mode_label=$3
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then error "The selection UI requires a terminal"; return 1; fi
+  total_all=$(awk 'END { print NR + 0 }' "$source_file")
+  if [ "$total_all" -eq 0 ]; then info "There are no groups."; return 2; fi
+
+  selected=$(new_temp) || return 1; : > "$selected"
+  visible=$(new_temp) || return 1
+  filter_query=""
+  filter_mode=false
+  build_filtered_groups "$source_file" "$filter_query" "$visible"
+  total=$(awk 'END { print NR + 0 }' "$visible")
+  cursor=1
+
+  old_stty=$(stty -g < /dev/tty) || return 1
+  stty -echo -icanon min 1 time 0 < /dev/tty
+  while :; do
+    render_group_selector "$visible" "$selected" "$cursor" "$total_all" "$filter_query" "$filter_mode" "$total" "$mode_label" > /dev/tty
+    read_key || { stty "$old_stty" < /dev/tty; return 1; }
+
+    if [ "$filter_mode" = "true" ]; then
+      case "$KEY" in
+        enter|escape)
+          filter_mode=false
+          ;;
+        backspace)
+          filter_query=${filter_query%?}
+          build_filtered_groups "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+          ;;
+        space|char|filter)
+          filter_query="$filter_query$KEY_TEXT"
+          build_filtered_groups "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+          ;;
+      esac
+      continue
+    fi
+
+    case "$KEY" in
+      up)
+        if [ "$total" -gt 0 ]; then
+          if [ "$cursor" -gt 1 ]; then cursor=$((cursor - 1)); else cursor=$total; fi
+        fi
+        ;;
+      down)
+        if [ "$total" -gt 0 ]; then
+          if [ "$cursor" -lt "$total" ]; then cursor=$((cursor + 1)); else cursor=1; fi
+        fi
+        ;;
+      space)
+        if [ "$total" -gt 0 ]; then
+          gid=$(awk -F '\t' -v line="$cursor" 'NR == line { print $1 }' "$visible")
+          toggle_selection "$gid" "$selected" || { stty "$old_stty" < /dev/tty; return 1; }
+        fi
+        ;;
+      filter)
+        filter_mode=true
+        ;;
+      enter)
+        if [ -s "$selected" ]; then break; fi
+        ;;
+      escape)
+        stty "$old_stty" < /dev/tty
+        printf '\033[H\033[2J' > /dev/tty
+        return 2
+        ;;
+    esac
+  done
+  stty "$old_stty" < /dev/tty
+  printf '\033[H\033[2J' > /dev/tty
+  cat "$selected" > "$output"
+}
+
+selected_group_hosts_to_file() {
+  json=$1; selected_ids_file=$2; out=$3
+  if ! jq -r --rawfile selected "$selected_ids_file" '
+    def selected_ids: ($selected | split("\n") | map(select(length > 0) | tonumber));
+    . as $root
+    | [
+        .groups[]?
+        | select((.id as $id | selected_ids | index($id)) != null)
+        | .hosts[]?
+        | if type == "object" then .id else . end
+      ]
+    | unique[]? as $hid
+    | [$hid, (($root.hosts[]? | select(.id == $hid) | .name) // ("host-" + ($hid|tostring)))]
+    | @tsv
+  ' "$json" > "$out"; then
+    error "Could not parse selected groups"
+    return 1
+  fi
+}
+
+run_selected_groups_action() {
+  target_status=$1
+  action_label=$2
+  mode_label=$3
+
+  groups_json=$(new_temp) || return 1
+  hosts_json=$(new_temp) || return 1
+  groups_tsv=$(new_temp) || return 1
+  selected_ids=$(new_temp) || return 1
+  hosts=$(new_temp) || return 1
+
+  fetch_groups_json "$groups_json" || return 1
+  fetch_hosts_json "$hosts_json" || return 1
+  groups_as_tsv_for_action "$target_status" "$groups_json" "$hosts_json" > "$groups_tsv" || return 1
+
+  if [ "$(awk 'END { print NR + 0 }' "$groups_tsv")" -eq 0 ]; then
+    info "No groups to $mode_label."
+    return 0
+  fi
+
+  select_groups "$groups_tsv" "$selected_ids" "$mode_label"; result=$?
+  case "$result" in
+    0)
+      selected_group_hosts_to_file "$groups_json" "$selected_ids" "$hosts" || return 1
+      bulk_update_from_file "$hosts" "$target_status" "$action_label"
+      ;;
+    2)
+      info "Cancelled"
+      ;;
+    *)
+      return "$result"
+      ;;
+  esac
+}
+
+stop_selected_groups() { run_selected_groups_action 2 "Stop" "stop"; }
+start_selected_groups() { run_selected_groups_action 0 "Start" "start"; }
+
+build_filtered_hosts() {
+  source_file=$1; query=$2; out_file=$3
+  if [ -z "$query" ]; then
+    cat "$source_file" > "$out_file"
+    return
+  fi
+  awk -F '\t' -v q="$query" '
+    BEGIN { ql = tolower(q) }
+    {
+      hay = tolower($1 " " $2 " " $3)
+      if (index(hay, ql) > 0) print
+    }' "$source_file" > "$out_file"
+}
+
+render_host_selector() {
+  file=$1; selected_file=$2; cursor=$3; total=$4; filter_query=$5; filter_mode=$6; visible_total=$7; mode_label=$8
+  width=$(terminal_width)
+  sep=$(printf '%*s' "$width" '' | tr ' ' '-')
+
+  printf '\033[H\033[2J'; print_logo
+  printf '\n%sSelect hosts to %s%s\n' "$BOLD" "$mode_label" "$RESET"
+  printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %s/%s search  %sEnter%s run  %sq/Esc%s cancel\n' \
+    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  if [ "$filter_mode" = "true" ]; then
+    printf '%s SEARCH%s  %s/%s%s_%s  %s(type to filter, Enter/Esc to finish)%s\n' \
+      "$YELLOW" "$RESET" "$BOLD" "$filter_query" "$RESET" "$YELLOW" "$DIM" "$RESET"
+  elif [ -n "$filter_query" ]; then
+    printf '%s Filter:%s %s%s%s  %s(press / to edit)%s\n' "$YELLOW" "$RESET" "$BOLD" "$filter_query" "$RESET" "$DIM" "$RESET"
+  fi
+  printf '%s%s%s\n' "$DIM" "$sep" "$RESET"
+
+  awk -F '\t' -v cursor="$cursor" -v selected="$selected_file" -v width="$width" \
+    -v cyan="$CYAN" -v green="$GREEN" -v dim="$DIM" -v bold="$BOLD" -v reset="$RESET" '
+    function clip(s, n) {
+      if (n < 2) return s
+      if (length(s) <= n) return s
+      return substr(s, 1, n - 1) "…"
+    }
+    BEGIN {
+      while ((getline line < selected) > 0) chosen[line]=1
+      name_w = width - 22
+      if (name_w < 18) name_w = 18
+    }
+    {
+      marker = chosen[$1] ? green "●" reset : dim "○" reset
+      pointer = (NR == cursor) ? cyan "❯" reset : " "
+      name = clip($2, name_w)
+      status = $3
+
+      if (NR == cursor) {
+        printf "%s %s %s%s%s  %s[%s]%s\n", pointer, marker, bold, name, reset, dim, status, reset
+      } else {
+        printf "%s %s %s  %s[%s]%s\n", pointer, marker, name, dim, status, reset
+      }
+      printf "    %shost id:%s %s%s%s\n", dim, reset, dim, $1, reset
+    }' "$file"
+
+  chosen_count=$(awk 'END { print NR + 0 }' "$selected_file")
+  printf '%s%s%s\n' "$DIM" "$sep" "$RESET"
+  printf '%s Selected %s%s %d%s / %d hosts   %sMatches%s %d\n' \
+    "$CYAN" "$RESET" "$BOLD" "$chosen_count" "$RESET" "$total" "$CYAN" "$RESET" "$visible_total"
+}
+
+select_hosts() {
+  source_file=$1; output=$2; mode_label=$3
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then error "The selection UI requires a terminal"; return 1; fi
+  total_all=$(awk 'END { print NR + 0 }' "$source_file")
+  if [ "$total_all" -eq 0 ]; then info "There are no hosts."; return 2; fi
+
+  selected=$(new_temp) || return 1; : > "$selected"
+  visible=$(new_temp) || return 1
+  filter_query=""
+  filter_mode=false
+  build_filtered_hosts "$source_file" "$filter_query" "$visible"
+  total=$(awk 'END { print NR + 0 }' "$visible")
+  cursor=1
+
+  old_stty=$(stty -g < /dev/tty) || return 1
+  stty -echo -icanon min 1 time 0 < /dev/tty
+  while :; do
+    render_host_selector "$visible" "$selected" "$cursor" "$total_all" "$filter_query" "$filter_mode" "$total" "$mode_label" > /dev/tty
+    read_key || { stty "$old_stty" < /dev/tty; return 1; }
+
+    if [ "$filter_mode" = "true" ]; then
+      case "$KEY" in
+        enter|escape)
+          filter_mode=false
+          ;;
+        backspace)
+          filter_query=${filter_query%?}
+          build_filtered_hosts "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+          ;;
+        space|char|filter)
+          filter_query="$filter_query$KEY_TEXT"
+          build_filtered_hosts "$source_file" "$filter_query" "$visible"
+          total=$(awk 'END { print NR + 0 }' "$visible")
+          if [ "$total" -eq 0 ]; then cursor=1
+          elif [ "$cursor" -gt "$total" ]; then cursor=$total
+          fi
+          ;;
+      esac
+      continue
+    fi
+
+    case "$KEY" in
+      up)
+        if [ "$total" -gt 0 ]; then
+          if [ "$cursor" -gt 1 ]; then cursor=$((cursor - 1)); else cursor=$total; fi
+        fi
+        ;;
+      down)
+        if [ "$total" -gt 0 ]; then
+          if [ "$cursor" -lt "$total" ]; then cursor=$((cursor + 1)); else cursor=1; fi
+        fi
+        ;;
+      space)
+        if [ "$total" -gt 0 ]; then
+          hid=$(awk -F '\t' -v line="$cursor" 'NR == line { print $1 }' "$visible")
+          toggle_selection "$hid" "$selected" || { stty "$old_stty" < /dev/tty; return 1; }
+        fi
+        ;;
+      filter)
+        filter_mode=true
+        ;;
+      enter)
+        if [ -s "$selected" ]; then break; fi
+        ;;
+      escape)
+        stty "$old_stty" < /dev/tty
+        printf '\033[H\033[2J' > /dev/tty
+        return 2
+        ;;
+    esac
+  done
+  stty "$old_stty" < /dev/tty
+  printf '\033[H\033[2J' > /dev/tty
+  cat "$selected" > "$output"
+}
+
+selected_hosts_to_file() {
+  hosts_json=$1; selected_ids_file=$2; out=$3
+  if ! jq -r --rawfile selected "$selected_ids_file" '
+    def selected_ids: ($selected | split("\n") | map(select(length > 0) | tonumber));
+    .records[]?
+    | select((.id as $id | selected_ids | index($id)) != null)
+    | [.id, (.hostname // ("host-" + ((.id // 0)|tostring)))]
+    | @tsv
+  ' "$hosts_json" > "$out"; then
+    error "Could not parse selected hosts"
+    return 1
+  fi
+}
+
+run_selected_hosts_action() {
+  target_status=$1
+  action_label=$2
+  mode_label=$3
+
+  hosts_json=$(new_temp) || return 1
+  hosts_tsv=$(new_temp) || return 1
+  selected_ids=$(new_temp) || return 1
+  selected_hosts=$(new_temp) || return 1
+
+  fetch_hosts_json "$hosts_json" || return 1
+  if ! hosts_as_tsv_for_action "$target_status" < "$hosts_json" > "$hosts_tsv"; then
+    error "Could not parse hosts list"
+    return 1
+  fi
+
+  if [ "$(awk 'END { print NR + 0 }' "$hosts_tsv")" -eq 0 ]; then
+    info "No hosts to $mode_label."
+    return 0
+  fi
+
+  select_hosts "$hosts_tsv" "$selected_ids" "$mode_label"; result=$?
+  case "$result" in
+    0)
+      selected_hosts_to_file "$hosts_json" "$selected_ids" "$selected_hosts" || return 1
+      bulk_update_from_file "$selected_hosts" "$target_status" "$action_label"
+      ;;
+    2)
+      info "Cancelled"
+      ;;
+    *)
+      return "$result"
+      ;;
+  esac
+}
+
+stop_selected_hosts() { run_selected_hosts_action 2 "Stop" "stop"; }
+start_selected_hosts() { run_selected_hosts_action 0 "Start" "start"; }
+
+read_menu_key() {
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    old_stty=$(stty -g < /dev/tty) || return 1
+    stty -echo -icanon min 1 time 0 < /dev/tty
+    MENU_KEY=$(dd bs=1 count=1 2>/dev/null < /dev/tty || true)
+    stty "$old_stty" < /dev/tty
+    printf '%s\n' "$MENU_KEY" > /dev/tty
+  else
+    IFS= read -r MENU_KEY || true
+  fi
+}
+
+prompt_group_input() {
+  printf 'Group name or id: '
+  IFS= read -r GROUP_INPUT || true
+  if [ -z "$GROUP_INPUT" ]; then
+    error "Group name or id is required"
+    return 1
+  fi
+}
+
+choose_action() {
+  print_logo; say ""
+  printf '%sChoose an action%s  %sPress a number to continue%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '%s───────────────────────────────────────────%s\n' "$DIM" "$RESET"
+  printf '  %s1%s  %s■%s Stop all hosts\n' "$CYAN" "$RESET" "$RED" "$RESET"
+  printf '  %s2%s  %s▶%s Start all hosts\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+  printf '  %s3%s  %s◉%s Select hosts to stop\n' "$CYAN" "$RESET" "$YELLOW" "$RESET"
+  printf '  %s4%s  %s◉%s Select hosts to start\n' "$CYAN" "$RESET" "$YELLOW" "$RESET"
+  printf '  %s5%s  %s◉%s Select groups to stop\n' "$CYAN" "$RESET" "$YELLOW" "$RESET"
+  printf '  %s6%s  %s◉%s Select groups to start\n' "$CYAN" "$RESET" "$YELLOW" "$RESET"
+  printf '  %s7%s  %s●%s Check host errors (exit status)\n' "$CYAN" "$RESET" "$CYAN" "$RESET"
+  printf '  %s8%s    Cancel\n' "$CYAN" "$RESET"
+  printf '%s───────────────────────────────────────────%s\n' "$DIM" "$RESET"
+  printf '%s›%s ' "$CYAN" "$RESET"
+  read_menu_key || return 1
+
+  case "$MENU_KEY" in
+    1)
+      COMMAND=stop-all
+      ;;
+    2)
+      COMMAND=start-all
+      ;;
+    3)
+      COMMAND=stop
+      ;;
+    4)
+      COMMAND=start
+      ;;
+    5)
+      COMMAND=stop-select
+      ;;
+    6)
+      COMMAND=start-select
+      ;;
+    7)
+      COMMAND=check
+      ;;
+    *)
+      COMMAND=cancel
+      ;;
+  esac
+}
+
+main() {
+  command=""
+  group=""
+  COMMAND_GROUP=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -y|--yes|--non-interactive)
+        ASSUME_YES=true
+        ;;
+      --invert-exit)
+        INVERT_EXIT=true
+        ;;
+      help|-h|--help)
+        usage
+        return 0
+        ;;
+      version|-v|--version)
+        say "mmonitctl $VERSION"
+        return 0
+        ;;
+      stop-all|start-all|stop|start|check|config)
+        if [ -n "$command" ]; then error "Only one command may be specified"; return 1; fi
+        command=$1
+        ;;
+      stop-group|start-group)
+        if [ -n "$command" ]; then error "Only one command may be specified"; return 1; fi
+        command=$1
+        shift
+        if [ "$#" -eq 0 ]; then error "$command requires <group-name-or-id>"; return 1; fi
+        group=$1
+        ;;
+      *)
+        usage
+        error "Unknown argument: $1"
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  require_commands || return 1
+
+  if [ "$command" = "config" ]; then
+    setup true
+    return $?
+  fi
+
+  if ! load_config; then
+    info "Credentials are not configured. Running setup."
+    setup false || return 1
+    load_config || return 1
+  fi
+
+  if [ -z "$command" ]; then
+    choose_action || return 1
+    command=$COMMAND
+    if [ "$command" = "stop-group" ] || [ "$command" = "start-group" ]; then
+      group=$COMMAND_GROUP
+    fi
+  fi
+
+  case "$command" in
+    cancel)
+      info "Cancelled"
+      return 0
+      ;;
+    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|check)
+      ;;
+    *)
+      usage
+      error "Unknown command: $command"
+      return 1
+      ;;
+  esac
+
+  case "$command" in
+    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select)
+      fetch_csrf_token || return 1
+      ;;
+  esac
+
+  case "$command" in
+    stop-all)
+      stop_all
+      ;;
+    start-all)
+      start_all
+      ;;
+    stop)
+      stop_selected_hosts
+      ;;
+    start)
+      start_selected_hosts
+      ;;
+    stop-group)
+      stop_group "$group"
+      ;;
+    start-group)
+      start_group "$group"
+      ;;
+    stop-select)
+      stop_selected_groups
+      ;;
+    start-select)
+      start_selected_groups
+      ;;
+    check)
+      check_errors
+      ;;
+  esac
+}
+
+main "$@"
