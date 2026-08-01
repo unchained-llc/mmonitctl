@@ -1,114 +1,141 @@
+[English](README.md) | [日本語](README_ja.md)
+
 # mmonit-cli-ng
 
-M/Monit の HTTP API を使って、ホスト監視の停止/再開を行う `sh + jq` ベースのCLIです。
+A POSIX `sh` + `jq` CLI for controlling M/Monit host monitoring state.
 
-## 機能
+Executable command: `mmonitctl`
 
-- `updownio` と揃えた CLI 体験（ロゴ表示・対話メニュー・進捗表示）
-- 全ホストの監視停止: `stop-all`（`status=2: Ignored`）
-- 全ホストの監視開始: `start-all`（`status=0: Active`）
-- 指定グループの監視停止: `stop-group <group>`
-- 指定グループの監視開始: `start-group <group>`
-- エラーチェック: `check`（異常が1件でもあれば `exit 1`、なければ `exit 0`）
-- 並列リクエスト実行（`MMONIT_CONCURRENCY`）
+## Features
 
-## 要件
+- Stop all hosts: `stop-all` (`status=2` = Ignored)
+- Start all hosts: `start-all` (`status=0` = Active)
+- Interactive host selection: `stop` / `start`
+- Group target by name or ID: `stop-group <group>` / `start-group <group>`
+- Interactive group selection (from menu)
+- Alert check command: `check`
+  - Uses `GET /api/2/reports/events/list?active=1&state=1`
+  - Exits `1` when at least one active alert event exists
+- Parallel updates (`MMONIT_CONCURRENCY`, default `8`)
 
-- POSIX `sh`
+## Requirements
+
+- POSIX-compatible `sh`
 - `curl`
 - `jq`
+- `awk`, `mktemp`, `stty`
 
-## インストール
+## Install
 
 ```sh
 make install
 ```
 
-デフォルトインストール先: `/usr/local/bin/mmonitctl`
+Default install path: `/usr/local/bin/mmonitctl`
 
-## 初回設定
+## Initial setup
 
-初回実行時に、次の情報を対話入力して `config.json` に保存します。
+On first run, the CLI prompts for:
 
 - M/Monit Base URL
 - Username
 - Password
 
-保存先:
+Saved config path:
 
 - macOS: `~/Library/Application Support/mmonitctl/config.json`
 - Linux: `~/.config/mmonitctl/config.json`
 
-再設定:
+Reconfigure:
 
 ```sh
 mmonitctl config
 ```
 
-## 使い方
+## Usage
 
 ```sh
-# 対話メニューを開く（updownio 互換の操作感）
-# 3/4: グループ一覧を表示し、Spaceで選択、/でフィルタ、Enterで停止/開始
-# 5/6: ホスト一覧を表示し、Spaceで選択、/でフィルタ、Enterで停止/開始
+# Open menu
 mmonitctl
 
-# 全ホスト停止（Ignored）
+# Stop/start all hosts
 mmonitctl stop-all
-
-# 全ホスト開始（Active）
 mmonitctl start-all
 
-# 異常有無チェック（異常ありなら終了コード1）
-mmonitctl check
-mmonitctl check --invert-exit
-
-# ホスト選択UI（一覧・選択・フィルタ）
+# Select hosts to stop/start
 mmonitctl stop
 mmonitctl start
 
-# グループ名で停止/開始
-mmonitctl stop-group "web"
-mmonitctl start-group "web"
-
-# グループIDでも指定可能
+# Stop/start specific group (name or id)
+mmonitctl stop-group web
+mmonitctl start-group web
 mmonitctl stop-group 94
 mmonitctl start-group 94
+
+# Check active alert events
+mmonitctl check
+
+# Invert exit code (alert=0, no-alert=1)
+mmonitctl check --invert-exit
 ```
 
-## 環境変数
+Compatibility flags (accepted):
+
+```sh
+mmonitctl stop-all --yes
+mmonitctl start-all --non-interactive
+```
+
+## Menu
+
+1. Stop all hosts
+2. Start all hosts
+3. Select hosts to stop
+4. Select hosts to start
+5. Select groups to stop
+6. Select groups to start
+7. Check host errors (exit status)
+8. Cancel
+
+## Interactive keys
+
+| Key | Action |
+|---|---|
+| `k` / `↑` / `Ctrl-P` | Move up |
+| `j` / `↓` / `Ctrl-N` | Move down |
+| `Space` | Toggle selection and move cursor to next item |
+| `A` | Select all currently visible items |
+| `/` | Enter filter input mode |
+| `Enter` | Run action with selected items (or exit filter input mode) |
+| `Backspace` | Delete one character in filter input mode |
+| `Esc` | Clear active filter (does not close selector) |
+| `q` | Cancel selector |
+
+## Environment variables
 
 - `MMONIT_BASE_URL`
 - `MMONIT_USERNAME`
 - `MMONIT_PASSWORD`
 - `MMONIT_CONFIG_DIR`
-- `MMONIT_CONCURRENCY`（デフォルト: `8`）
+- `MMONIT_CONCURRENCY` (default: `8`)
 - `NO_COLOR=1`
 
-`MMONIT_BASE_URL` / `MMONIT_USERNAME` / `MMONIT_PASSWORD` を指定すると、保存済み設定より優先されます。
+`MMONIT_BASE_URL`, `MMONIT_USERNAME`, and `MMONIT_PASSWORD` override saved config.
 
-## API利用方針
+## API usage
 
-- 認証: Basic認証（`-u user:pass`）
-- CSRFトークン取得: `GET /api/2/session/get`
-- ホスト一覧: `GET /api/2/admin/hosts/list`
-- ホスト詳細: `GET /api/2/admin/hosts/get?id=<id>`
-- ホスト更新: `POST /api/2/admin/hosts/update`
-- グループ一覧: `GET /api/2/admin/groups/list`
+- `GET /api/2/session/get` (CSRF token)
+- `GET /api/2/admin/hosts/list`
+- `GET /api/2/admin/hosts/get?id=<id>`
+- `POST /api/2/admin/hosts/update`
+- `GET /api/2/admin/groups/list`
+- `GET /api/2/reports/events/list?active=1&state=1` (`check`)
 
-`hosts/update` では `status` だけでなく、`hosts/get` で取得した必要パラメータ（`hostname`, `monituser`, `monitpassword`, `ipaddrout`, `portout`, `keepname`, `skew`, `description`）を引き継いで更新しています。
+For `hosts/update`, values from `hosts/get` are preserved and sent together with `status`.
 
-## 開発
+## Development
 
 ```sh
 make lint
 make test
 ```
-
-## トラブルシュート
-
-- `401` が出る場合
-  - Base URL が正しいか（プロキシ配下のパス含む）
-  - ユーザー権限で `/api/2/admin/*` が許可されているか
-- 実行速度を上げたい場合
-  - `MMONIT_CONCURRENCY` を増やす（例: `MMONIT_CONCURRENCY=16 mmonitctl stop-all`）
