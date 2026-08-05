@@ -57,13 +57,14 @@ Usage:
   mmonitctl start [--yes]                 Select hosts to start (interactive)
   mmonitctl stop-group <group> [--yes]    Stop hosts in group
   mmonitctl start-group <group> [--yes]   Start hosts in group
-  mmonitctl check                         Exit 1 if any host has errors, else 0
+  mmonitctl status                        Show whether all hosts are Active
+  mmonitctl health                        Exit 1 if any host has errors, else 0
   mmonitctl config                        Configure credentials
   mmonitctl version                       Print version
 
 Options:
   -y, --yes, --non-interactive           Compatibility flag (accepted)
-  --invert-exit                          Invert exit status for check (error=0, ok=1)
+  --invert-exit                          Invert exit status for health (error=0, ok=1)
   -h, --help                             Show this help
 
 Environment:
@@ -583,6 +584,31 @@ start_group() {
   file=$(new_temp) || return 1
   group_hosts_to_file "$group" "$file" || return 1
   bulk_update_from_file "$file" 0 "Start"
+}
+
+check_monitoring_state() {
+  json=$(new_temp) || return 1
+  fetch_hosts_json "$json" || return 1
+
+  if ! jq -e '.records | type == "array"' >/dev/null 2>&1 < "$json"; then
+    error "Could not parse hosts response"
+    return 1
+  fi
+
+  total=$(jq '.records | length' "$json")
+  if [ "$total" -eq 0 ]; then
+    error "Could not determine monitoring state: no hosts found"
+    return 1
+  fi
+
+  active=$(jq '[.records[] | select(((.status // "") | tostring | ascii_downcase) == "active")] | length' "$json")
+  if [ "$active" -eq "$total" ]; then
+    printf '%s✓%s All hosts are Active (%d/%d).\n' "$GREEN" "$RESET" "$active" "$total"
+    return 0
+  fi
+
+  printf '%s✗%s Monitoring is not active on all hosts (%d/%d Active).\n' "$RED" "$RESET" "$active" "$total"
+  return 1
 }
 
 check_errors() {
@@ -1214,7 +1240,7 @@ choose_action() {
       COMMAND=start-select
       ;;
     7)
-      COMMAND=check
+      COMMAND=health
       ;;
     *)
       COMMAND=cancel
@@ -1243,7 +1269,7 @@ main() {
         say "mmonitctl $VERSION"
         return 0
         ;;
-      stop-all|start-all|stop|start|check|config)
+      stop-all|start-all|stop|start|status|health|config)
         if [ -n "$command" ]; then error "Only one command may be specified"; return 1; fi
         command=$1
         ;;
@@ -1289,7 +1315,7 @@ main() {
       info "Cancelled"
       return 0
       ;;
-    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|check)
+    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|status|health)
       ;;
     *)
       usage
@@ -1329,7 +1355,10 @@ main() {
     start-select)
       start_selected_groups
       ;;
-    check)
+    status)
+      check_monitoring_state
+      ;;
+    health)
       check_errors
       ;;
     *)

@@ -13,7 +13,9 @@ M/Monit のホスト監視状態を操作する、POSIX `sh` + `jq` 製 CLI で�
 - ホスト選択停止/開始: `stop` / `start`
 - グループ指定停止/開始: `stop-group <group>` / `start-group <group>`（名前/ID対応）
 - グループ選択停止/開始（メニュー経由）
-- アラートチェック: `check`
+- Homebridge 用の監視状態取得: `status`
+  - 全ホストが `Active` なら成功（終了コード `0`）、1台でもそれ以外なら失敗（終了コード `1`）し、状態メッセージを表示
+- アラートチェック: `health`
   - `GET /api/2/reports/events/list?active=1&state=1` を使用
   - アクティブなアラートイベントが1件以上なら `exit 1`
 - 並列更新（`MMONIT_CONCURRENCY`、デフォルト `8`）
@@ -72,11 +74,14 @@ mmonitctl start-group web
 mmonitctl stop-group 94
 mmonitctl start-group 94
 
+# Homebridge の state_cmd 用（true / false を出力）
+mmonitctl status
+
 # アクティブアラートイベントの有無をチェック
-mmonitctl check
+mmonitctl health
 
 # 終了コードを反転（alert=0, no-alert=1）
-mmonitctl check --invert-exit
+mmonitctl health --invert-exit
 ```
 
 互換オプション（受け付けのみ）:
@@ -129,7 +134,8 @@ mmonitctl start-all --non-interactive
 - `GET /api/2/admin/hosts/get?id=<id>`
 - `POST /api/2/admin/hosts/update`
 - `GET /api/2/admin/groups/list`
-- `GET /api/2/reports/events/list?active=1&state=1`（`check`）
+- `GET /api/2/reports/events/list?active=1&state=1`（`health`）
+- `GET /api/2/admin/hosts/list`（`status`）
 
 `hosts/update` では、`hosts/get` で取得した値を `status` と一緒に引き継いで送信します。
 

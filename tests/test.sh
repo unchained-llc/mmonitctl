@@ -78,7 +78,11 @@ case "$url" in
     fi
     ;;
   *"/api/2/admin/hosts/list"*)
-    body='{"totalRecords":3,"records":[{"id":1,"hostname":"host-a","status":"Active"},{"id":2,"hostname":"host-b","status":"Active"},{"id":3,"hostname":"host-c","status":"Inactive"}]}'
+    if [ "${MOCK_HOSTS_ACTIVE:-0}" = "1" ]; then
+      body='{"totalRecords":3,"records":[{"id":1,"hostname":"host-a","status":"Active"},{"id":2,"hostname":"host-b","status":"Active"},{"id":3,"hostname":"host-c","status":"Active"}]}'
+    else
+      body='{"totalRecords":3,"records":[{"id":1,"hostname":"host-a","status":"Active"},{"id":2,"hostname":"host-b","status":"Active"},{"id":3,"hostname":"host-c","status":"Inactive"}]}'
+    fi
     ;;
   *"/api/2/admin/groups/list")
     body='{"hosts":[{"id":1,"name":"host-a"},{"id":2,"name":"host-b"},{"id":3,"name":"host-c"}],"groups":[{"id":10,"name":"web","hosts":[{"id":2},{"id":3}]},{"id":11,"name":"empty","hosts":[]}]}'
@@ -151,19 +155,23 @@ printf '%s' "$output" | grep -F '1 hosts updated, 1 skipped.' >/dev/null || fail
 grep -F 'id=3' "$MOCK_LOG" >/dev/null || fail "start-group should only update host id=3"
 grep -F 'status=0' "$MOCK_LOG" >/dev/null || fail "start-group did not set status=0"
 
-output=$("$ROOT/bin/mmonitctl" check)
-printf '%s' "$output" | grep -F 'No active monitoring alert events.' >/dev/null || fail "check output"
+output=$("$ROOT/bin/mmonitctl" status 2>&1) && fail "status should fail when a host is inactive"
+printf '%s' "$output" | grep -F 'Monitoring is not active on all hosts (2/3 Active).' >/dev/null || fail "status inactive output"
+MOCK_HOSTS_ACTIVE=1 "$ROOT/bin/mmonitctl" status >/dev/null || fail "status should succeed when all hosts are active"
 
-if MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" check >/dev/null 2>&1; then
-  fail "check should fail when host is red/orange"
+output=$("$ROOT/bin/mmonitctl" health)
+printf '%s' "$output" | grep -F 'No active monitoring alert events.' >/dev/null || fail "health output"
+
+if MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" health >/dev/null 2>&1; then
+  fail "health should fail when host is red/orange"
 fi
 
-if "$ROOT/bin/mmonitctl" check --invert-exit >/dev/null 2>&1; then
-  fail "check --invert-exit should fail when all hosts are healthy"
+if "$ROOT/bin/mmonitctl" health --invert-exit >/dev/null 2>&1; then
+  fail "health --invert-exit should fail when all hosts are healthy"
 fi
 
-if ! MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" check --invert-exit >/dev/null 2>&1; then
-  fail "check --invert-exit should succeed when host is red/orange"
+if ! MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" health --invert-exit >/dev/null 2>&1; then
+  fail "health --invert-exit should succeed when host is red/orange"
 fi
 
 "$ROOT/bin/mmonitctl" --version | grep -F 'mmonitctl 0.1.0' >/dev/null || fail "version"
@@ -180,7 +188,7 @@ if "$ROOT/bin/mmonitctl" resume-group web >/dev/null 2>&1; then
   fail "resume-group should be removed"
 fi
 "$ROOT/bin/mmonitctl" --help | grep -F 'mmonitctl start-all [--yes]' >/dev/null || fail "help start-all"
-"$ROOT/bin/mmonitctl" --help | grep -F 'mmonitctl check' >/dev/null || fail "help check"
+"$ROOT/bin/mmonitctl" --help | grep -F 'mmonitctl status' >/dev/null || fail "help status"
 "$ROOT/bin/mmonitctl" --help | grep -F -- '--invert-exit' >/dev/null || fail "help invert-exit"
 
 printf 'OK\n'

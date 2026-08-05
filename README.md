@@ -13,7 +13,9 @@ Executable command: `mmonitctl`
 - Interactive host selection: `stop` / `start`
 - Group target by name or ID: `stop-group <group>` / `start-group <group>`
 - Interactive group selection (from menu)
-- Alert check command: `check`
+- Monitoring state command for Homebridge: `status`
+  - Prints a status message and exits `0` when all hosts are `Active`, otherwise exits `1`
+- Alert check command: `health`
   - Uses `GET /api/2/reports/events/list?active=1&state=1`
   - Exits `1` when at least one active alert event exists
 - Parallel updates (`MMONIT_CONCURRENCY`, default `8`)
@@ -72,11 +74,14 @@ mmonitctl start-group web
 mmonitctl stop-group 94
 mmonitctl start-group 94
 
+# Print monitoring state for Homebridge state_cmd
+mmonitctl status
+
 # Check active alert events
-mmonitctl check
+mmonitctl health
 
 # Invert exit code (alert=0, no-alert=1)
-mmonitctl check --invert-exit
+mmonitctl health --invert-exit
 ```
 
 Compatibility flags (accepted):
@@ -129,7 +134,8 @@ mmonitctl start-all --non-interactive
 - `GET /api/2/admin/hosts/get?id=<id>`
 - `POST /api/2/admin/hosts/update`
 - `GET /api/2/admin/groups/list`
-- `GET /api/2/reports/events/list?active=1&state=1` (`check`)
+- `GET /api/2/reports/events/list?active=1&state=1` (`health`)
+- `GET /api/2/admin/hosts/list` (`status`)
 
 For `hosts/update`, values from `hosts/get` are preserved and sent together with `status`.
 
