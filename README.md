@@ -19,6 +19,7 @@ Executable command: `mmonitctl`
   - Uses `GET /api/2/reports/events/list?active=1&state=1`
   - Exits `1` when at least one active alert event exists
 - Parallel updates (`MMONIT_CONCURRENCY`, default `8`)
+- Alert rule On/Off: all rules, or search and select rules interactively
 
 ## Requirements
 
@@ -74,6 +75,14 @@ mmonitctl start-group web
 mmonitctl stop-group 94
 mmonitctl start-group 94
 
+# Turn all alert rules off/on
+mmonitctl alerts-off-all
+mmonitctl alerts-on-all
+
+# Search and select alert rules to turn off/on
+mmonitctl alerts-off
+mmonitctl alerts-on
+
 # Print monitoring state for Homebridge state_cmd
 mmonitctl status
 
@@ -100,7 +109,16 @@ mmonitctl start-all --non-interactive
 5. Select groups to stop
 6. Select groups to start
 7. Check host errors (exit status)
-8. Cancel
+0. Cancel
+
+Additional menu keys: `a` starts all alert rules, `s` stops all,
+`d` selects rules to stop, and `f` selects rules to start.
+
+In the alert selector, press `/` to filter by rule name, ID, or On/Off state,
+press Enter to finish filtering, use Space to select rules, and press Enter to apply.
+Only rules requiring a state change appear. Updates run in parallel, skip rules
+already in the requested state, and re-fetch the list to verify the result.
+These commands change notification rule activity; host monitoring and rule conditions remain intact.
 
 ## Interactive keys
 
@@ -136,6 +154,12 @@ mmonitctl start-all --non-interactive
 - `GET /api/2/admin/groups/list`
 - `GET /api/2/reports/events/list?active=1&state=1` (`health`)
 - `GET /api/2/admin/hosts/list` (`status`)
+- `GET /admin/alerts/list` (alert rules)
+- `POST /admin/alerts/updateactive` (`id`, `active=1` for On / `active=0` for Off)
+
+The alert endpoints are used by the M/Monit admin UI and are not documented in
+the public HTTP API. Check compatibility when upgrading M/Monit. Updates use
+the session CSRF token and its session cookie with the existing Basic authentication settings.
 
 For `hosts/update`, values from `hosts/get` are preserved and sent together with `status`.
 

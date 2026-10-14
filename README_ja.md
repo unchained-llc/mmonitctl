@@ -19,6 +19,7 @@ M/Monit のホスト監視状態を操作する、POSIX `sh` + `jq` 製 CLI で�
   - `GET /api/2/reports/events/list?active=1&state=1` を使用
   - アクティブなアラートイベントが1件以上なら `exit 1`
 - 並列更新（`MMONIT_CONCURRENCY`、デフォルト `8`）
+- アラートルールのOn/Off（全て、または検索して対話選択）
 
 ## 要件
 
@@ -74,6 +75,14 @@ mmonitctl start-group web
 mmonitctl stop-group 94
 mmonitctl start-group 94
 
+# 全アラートルールをOff / On
+mmonitctl alerts-off-all
+mmonitctl alerts-on-all
+
+# アラートルールを検索・選択してOff / On
+mmonitctl alerts-off
+mmonitctl alerts-on
+
 # Homebridge の state_cmd 用（true / false を出力）
 mmonitctl status
 
@@ -100,7 +109,15 @@ mmonitctl start-all --non-interactive
 5. Select groups to stop
 6. Select groups to start
 7. Check host errors (exit status)
-8. Cancel
+0. Cancel
+
+追加メニューキー: `a` は全アラートOn、`s` は全アラートOff、
+`d` は検索・選択してOff、`f` は検索・選択してOnです。
+
+アラート選択画面では `/` でルール名・ID・On/Off状態を検索し、Enterで検索入力を終了、
+Spaceで対象を選択、Enterで実行します。変更が必要なルールだけを表示します。
+更新は並列で実行し、既に同じ状態のルールはスキップします。更新後は一覧を再取得して結果を確認します。
+変更するのは通知ルールの有効状態だけで、ホストの監視状態やルール条件は維持します。
 
 ## 選択UIキー
 
@@ -136,6 +153,11 @@ mmonitctl start-all --non-interactive
 - `GET /api/2/admin/groups/list`
 - `GET /api/2/reports/events/list?active=1&state=1`（`health`）
 - `GET /api/2/admin/hosts/list`（`status`）
+- `GET /admin/alerts/list`（アラートルール一覧）
+- `POST /admin/alerts/updateactive`（`id`、Onは`active=1`、Offは`active=0`）
+
+アラート用の経路はM/Monit管理画面が使用しているもので、公開HTTP API資料には記載されていません。
+M/Monitの更新時には互換性を確認してください。更新にはセッションのCSRFトークン・Cookieと既存のBasic認証設定を使用します。
 
 `hosts/update` では、`hosts/get` で取得した値を `status` と一緒に引き継いで送信します。
 

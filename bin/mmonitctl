@@ -8,6 +8,7 @@ ASSUME_YES=false
 INVERT_EXIT=false
 TMP_FILES=""
 CSRF_TOKEN=""
+SESSION_COOKIE=""
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
   RESET=$(printf '\033[0m'); BOLD=$(printf '\033[1m'); DIM=$(printf '\033[2m')
@@ -57,6 +58,10 @@ Usage:
   mmonitctl start [--yes]                 Select hosts to start (interactive)
   mmonitctl stop-group <group> [--yes]    Stop hosts in group
   mmonitctl start-group <group> [--yes]   Start hosts in group
+  mmonitctl alerts-off-all [--yes]       Turn off all alert rules
+  mmonitctl alerts-on-all [--yes]        Turn on all alert rules
+  mmonitctl alerts-off [--yes]           Search and select alert rules to turn off
+  mmonitctl alerts-on [--yes]            Search and select alert rules to turn on
   mmonitctl status                        Show whether all hosts are Active
   mmonitctl health                        Exit 1 if any host has errors, else 0
   mmonitctl config                        Configure credentials
@@ -171,6 +176,9 @@ api_request() {
   endpoint=$2
   shift 2
   response=$(new_temp) || return 1
+  if [ -n "$SESSION_COOKIE" ]; then
+    set -- --cookie "$SESSION_COOKIE" "$@"
+  fi
 
   status=$(curl --silent --show-error --compressed \
     --output "$response" --write-out '%{http_code}' \
@@ -195,8 +203,12 @@ api_request() {
 }
 
 fetch_csrf_token() {
+  SESSION_COOKIE=$(new_temp) || return 1
+  # Keep one session for the token and all workers. Only this request writes
+  # the cookie jar; parallel updates read it without modifying it.
+  TMP_FILES="$TMP_FILES $SESSION_COOKIE"
   json=$(new_temp) || return 1
-  api_request GET /api/2/session/get > "$json" || return 1
+  api_request GET /api/2/session/get --cookie-jar "$SESSION_COOKIE" > "$json" || return 1
   CSRF_TOKEN=$(jq -r '.CSRFToken // empty' "$json")
   if [ -z "$CSRF_TOKEN" ]; then
     error "Could not get CSRF token from /api/2/session/get"
@@ -494,10 +506,11 @@ bulk_update_from_file() {
   file=$1
   target_status=$2
   action_label=$3
+  resource=${4:-hosts}
 
   count=$(awk 'END { print NR + 0 }' "$file")
   if [ "$count" -eq 0 ]; then
-    info "No hosts matched."
+    info "No $resource matched."
     return 0
   fi
 
@@ -505,16 +518,20 @@ bulk_update_from_file() {
   rm -f "$result_dir"
   mkdir "$result_dir" || return 1
 
-  printf '%s%s●%s  %s %d hosts in parallel %s%s(workers: %s)%s\n\n' \
-    "$BOLD" "$CYAN" "$RESET" "$action_label" "$count" "$RESET" "$DIM" "$CONCURRENCY" "$RESET"
+  printf '%s%s●%s  %s %d %s in parallel %s%s(workers: %s)%s\n\n' \
+    "$BOLD" "$CYAN" "$RESET" "$action_label" "$count" "$resource" "$RESET" "$DIM" "$CONCURRENCY" "$RESET"
 
   running=0
   index=0
   tab=$(printf '\t')
-  while IFS="$tab" read -r id hostname; do
+  while IFS="$tab" read -r id hostname current; do
     [ -n "$id" ] || continue
     index=$((index + 1))
-    run_host_job "$id" "$target_status" "$result_dir" "$index" "$hostname" &
+    if [ "$resource" = alerts ]; then
+      run_alert_job "$id" "$target_status" "$result_dir" "$index" "$hostname" "$current" &
+    else
+      run_host_job "$id" "$target_status" "$result_dir" "$index" "$hostname" &
+    fi
     running=$((running + 1))
     if [ "$running" -ge "$CONCURRENCY" ]; then
       wait
@@ -522,6 +539,11 @@ bulk_update_from_file() {
     fi
   done < "$file"
   wait
+
+  if [ "$resource" = alerts ]; then
+    verified_alerts=$(new_temp) || return 1
+    fetch_alerts_json "$verified_alerts" || return 1
+  fi
 
   failures=0
   changed=0
@@ -534,6 +556,14 @@ bulk_update_from_file() {
     else
       tab=$(printf '\t')
       IFS="$tab" read -r row status name < "$result_dir/$i"
+      if [ "$resource" = alerts ] && [ "$status" = ok ]; then
+        alert_id=$(awk -F '\t' -v row="$i" 'NR == row {print $1}' "$file")
+        if ! jq -e --arg id "$alert_id" --arg active "$target_status" \
+          'any(.records[]; (.id|tostring) == $id and (.active == ($active == "1")))' \
+          "$verified_alerts" >/dev/null; then
+          status=failed
+        fi
+      fi
       case "$status" in
         ok)
           changed=$((changed + 1))
@@ -553,11 +583,79 @@ bulk_update_from_file() {
   done
 
   say ""
-  success "$changed hosts updated, $skipped skipped."
+  success "$changed $resource updated, $skipped skipped."
   if [ "$failures" -ne 0 ]; then
-    error "$failures/$count hosts failed"
+    error "$failures/$count $resource failed"
     return 1
   fi
+}
+
+fetch_alerts_json() {
+  alerts_out=$1
+  alerts_raw=$(new_temp) || return 1
+  api_request GET /admin/alerts/list > "$alerts_raw" || return 1
+  if ! jq -e '
+    (if type == "array" then . else (.records // .alerts) end)
+    | if type != "array" then error("Expected alert array") else . end
+    | map(
+        if (.id | tostring | test("^[1-9][0-9]*$")) and
+           (.description | type == "string") and
+           (.active == true or .active == false or .active == 1 or .active == 0 or .active == "1" or .active == "0")
+        then .active = (.active == true or .active == 1 or .active == "1")
+        else error("Invalid alert rule") end)
+    | {records: .}
+  ' "$alerts_raw" > "$alerts_out"; then
+    error "Could not parse alert rules response"
+    return 1
+  fi
+}
+
+run_alert_job() {
+  id=$1; target_active=$2; result_dir=$3; index=$4; label=$5; current=$6
+  if [ "$current" = "$target_active" ]; then
+    printf '%s\t%s\t%s\n' "$index" skipped "$label" > "$result_dir/$index"
+  elif api_request POST /admin/alerts/updateactive \
+    --header "X-CSRF-Token: $CSRF_TOKEN" \
+    --header "CSRFToken: $CSRF_TOKEN" \
+    --data-urlencode "id=$id" --data-urlencode "active=$target_active" >/dev/null; then
+    printf '%s\t%s\t%s\n' "$index" ok "$label" > "$result_dir/$index"
+  else
+    printf '%s\t%s\t%s\n' "$index" failed "$label" > "$result_dir/$index"
+  fi
+}
+
+run_alerts_action() {
+  target_active=$1; interactive=$2
+  if [ "$target_active" = 1 ]; then mode_label=on; else mode_label=off; fi
+  alert_action_label="Turn $mode_label"
+  alerts_json=$(new_temp) || return 1
+  alerts_tsv=$(new_temp) || return 1
+  alert_ids=$(new_temp) || return 1
+  targets=$(new_temp) || return 1
+  fetch_alerts_json "$alerts_json" || return 1
+  jq -r --arg active "$target_active" --arg interactive "$interactive" '
+    .records[]
+    | select($interactive != "true" or .active != ($active == "1"))
+    | [.id, (.description | gsub("[\\t\\r\\n]"; " ")),
+       (if .active then "On" else "Off" end)] | @tsv
+  ' "$alerts_json" > "$alerts_tsv" || return 1
+  if [ "$interactive" = true ]; then
+    if [ ! -s "$alerts_tsv" ]; then info "No alerts to turn $mode_label."; return 0; fi
+    select_hosts "$alerts_tsv" "$alert_ids" "turn $mode_label" alerts; result=$?
+    case "$result" in
+      0) ;;
+      2) info "Cancelled"; return 0 ;;
+      *) return "$result" ;;
+    esac
+  else
+    awk -F '\t' '{print $1}' "$alerts_tsv" > "$alert_ids"
+  fi
+  jq -r --rawfile ids "$alert_ids" '
+    ($ids | split("\n")) as $selected
+    | .records[] | select((.id|tostring) as $id | $selected | index($id))
+    | [.id, (.description | gsub("[\\t\\r\\n]"; " ")), (if .active then 1 else 0 end)] | @tsv
+  ' "$alerts_json" > "$targets" || return 1
+  bulk_update_from_file "$targets" "$target_active" "$alert_action_label" alerts
 }
 
 stop_all() {
@@ -971,11 +1069,12 @@ build_filtered_hosts() {
 
 render_host_selector() {
   file=$1; selected_file=$2; cursor=$3; total=$4; filter_query=$5; filter_mode=$6; visible_total=$7; mode_label=$8
+  item_label=${9:-hosts}
   width=$(terminal_width)
   sep=$(printf '%*s' "$width" '' | tr ' ' '-')
 
   printf '\033[H\033[J'; print_logo
-  printf '\n%sSelect hosts to %s%s\n' "$BOLD" "$mode_label" "$RESET"
+  printf '\n%sSelect %s to %s%s\n' "$BOLD" "$item_label" "$mode_label" "$RESET"
   printf '%sj/k · ↑↓ · Ctrl-P/N%s move  %sSpace%s toggle  %sA%s select all  %s/%s search  %sEnter%s run  %sq%s cancel  %sEsc%s clear filter\n' \
     "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
   if [ "$filter_mode" = "true" ]; then
@@ -987,7 +1086,7 @@ render_host_selector() {
   printf '%s%s%s\n' "$DIM" "$sep" "$RESET"
 
   awk -F '\t' -v cursor="$cursor" -v selected="$selected_file" -v width="$width" \
-    -v cyan="$CYAN" -v green="$GREEN" -v dim="$DIM" -v bold="$BOLD" -v reset="$RESET" '
+    -v cyan="$CYAN" -v green="$GREEN" -v dim="$DIM" -v bold="$BOLD" -v reset="$RESET" -v item_label="$item_label" '
     function clip(s, n) {
       if (n < 2) return s
       if (length(s) <= n) return s
@@ -1005,20 +1104,21 @@ render_host_selector() {
       status = $3
 
       if (NR == cursor) {
-        printf "%s %s %s%s%s  %s[%s]%s  %shost id:%s %s%s\n", pointer, marker, bold, name, reset, dim, status, reset, dim, reset, dim, $1, reset
+        printf "%s %s %s%s%s  %s[%s]%s  %s%s id:%s %s%s\n", pointer, marker, bold, name, reset, dim, status, reset, dim, (item_label == "alerts" ? "alert" : "host"), reset, dim, $1, reset
       } else {
-        printf "%s %s %s  %s[%s]%s  %shost id:%s %s%s\n", pointer, marker, name, dim, status, reset, dim, reset, dim, $1, reset
+        printf "%s %s %s  %s[%s]%s  %s%s id:%s %s%s\n", pointer, marker, name, dim, status, reset, dim, (item_label == "alerts" ? "alert" : "host"), reset, dim, $1, reset
       }
     }' "$file"
 
   chosen_count=$(awk 'END { print NR + 0 }' "$selected_file")
   printf '%s%s%s\n' "$DIM" "$sep" "$RESET"
-  printf '%s Selected %s%s %d%s / %d hosts   %sMatches%s %d\n' \
-    "$CYAN" "$RESET" "$BOLD" "$chosen_count" "$RESET" "$total" "$CYAN" "$RESET" "$visible_total"
+  printf '%s Selected %s%s %d%s / %d %s   %sMatches%s %d\n' \
+    "$CYAN" "$RESET" "$BOLD" "$chosen_count" "$RESET" "$total" "$item_label" "$CYAN" "$RESET" "$visible_total"
 }
 
 select_hosts() {
   source_file=$1; output=$2; mode_label=$3
+  item_label=${4:-hosts}
   if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then error "The selection UI requires a terminal"; return 1; fi
   total_all=$(awk 'END { print NR + 0 }' "$source_file")
   if [ "$total_all" -eq 0 ]; then info "There are no hosts."; return 2; fi
@@ -1034,7 +1134,7 @@ select_hosts() {
   old_stty=$(stty -g < /dev/tty) || return 1
   stty -echo -icanon min 1 time 0 < /dev/tty
   while :; do
-    render_host_selector "$visible" "$selected" "$cursor" "$total_all" "$filter_query" "$filter_mode" "$total" "$mode_label" > /dev/tty
+    render_host_selector "$visible" "$selected" "$cursor" "$total_all" "$filter_query" "$filter_mode" "$total" "$mode_label" "$item_label" > /dev/tty
     read_key || { stty "$old_stty" < /dev/tty; return 1; }
 
     if [ "$filter_mode" = "true" ]; then
@@ -1206,7 +1306,7 @@ prompt_group_input() {
 
 choose_action() {
   print_logo; say ""
-  printf '%sChoose an action%s  %sPress a number to continue%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '%sChoose an action%s  %sPress a key to continue%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '%s───────────────────────────────────────────%s\n' "$DIM" "$RESET"
   printf '  %s1%s  %s■%s Stop all hosts\n' "$CYAN" "$RESET" "$RED" "$RESET"
   printf '  %s2%s  %s▶%s Start all hosts\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
@@ -1215,7 +1315,11 @@ choose_action() {
   printf '  %s5%s  %s◉%s Select groups to stop\n' "$CYAN" "$RESET" "$YELLOW" "$RESET"
   printf '  %s6%s  %s◉%s Select groups to start\n' "$CYAN" "$RESET" "$YELLOW" "$RESET"
   printf '  %s7%s  %s●%s Check host errors (exit status)\n' "$CYAN" "$RESET" "$CYAN" "$RESET"
-  printf '  %s8%s    Cancel\n' "$CYAN" "$RESET"
+  printf '  %sa%s    Start all alert rules\n' "$CYAN" "$RESET"
+  printf '  %ss%s    Stop all alert rules\n' "$CYAN" "$RESET"
+  printf '  %sd%s    Select alert rules to stop\n' "$CYAN" "$RESET"
+  printf '  %sf%s    Select alert rules to start\n' "$CYAN" "$RESET"
+  printf '  %s0%s    Cancel\n' "$CYAN" "$RESET"
   printf '%s───────────────────────────────────────────%s\n' "$DIM" "$RESET"
   printf '%s›%s ' "$CYAN" "$RESET"
   read_menu_key || return 1
@@ -1242,6 +1346,11 @@ choose_action() {
     7)
       COMMAND=health
       ;;
+    a|A) COMMAND=alerts-on-all ;;
+    s|S) COMMAND=alerts-off-all ;;
+    d|D) COMMAND=alerts-off ;;
+    f|F) COMMAND=alerts-on ;;
+    0) COMMAND=cancel ;;
     *)
       COMMAND=cancel
       ;;
@@ -1269,7 +1378,7 @@ main() {
         say "mmonitctl $VERSION"
         return 0
         ;;
-      stop-all|start-all|stop|start|status|health|config)
+      stop-all|start-all|stop|start|status|health|config|alerts-off-all|alerts-on-all|alerts-off|alerts-on)
         if [ -n "$command" ]; then error "Only one command may be specified"; return 1; fi
         command=$1
         ;;
@@ -1315,7 +1424,7 @@ main() {
       info "Cancelled"
       return 0
       ;;
-    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|status|health)
+    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|status|health|alerts-off-all|alerts-on-all|alerts-off|alerts-on)
       ;;
     *)
       usage
@@ -1325,12 +1434,16 @@ main() {
   esac
 
   case "$command" in
-    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select)
+    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|alerts-off-all|alerts-on-all|alerts-off|alerts-on)
       fetch_csrf_token || return 1
       ;;
   esac
 
   case "$command" in
+    alerts-off-all) run_alerts_action 0 false ;;
+    alerts-on-all) run_alerts_action 1 false ;;
+    alerts-off) run_alerts_action 0 true ;;
+    alerts-on) run_alerts_action 1 true ;;
     stop-all)
       stop_all
       ;;
