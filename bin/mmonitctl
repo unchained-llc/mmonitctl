@@ -840,6 +840,9 @@ read_key() {
     else
       KEY=escape
     fi
+  elif [ "${filter_mode:-false}" = true ] && { [ "$key" = j ] || [ "$key" = k ] || [ "$key" = q ] || [ "$key" = A ]; }; then
+    KEY=char
+    KEY_TEXT=$key
   elif [ "$key" = "$(printf '\020')" ] || [ "$key" = k ]; then
     KEY=up
   elif [ "$key" = "$(printf '\016')" ] || [ "$key" = j ]; then

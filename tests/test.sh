@@ -170,6 +170,32 @@ fail() {
   exit 1
 }
 
+# Exercise the actual key decoder with file input instead of a terminal.
+(
+  awk '/^read_key\(\) \{/ { copying=1 } copying { print } copying && /^\}/ { exit }' \
+    "$ROOT/bin/mmonitctl" | sed 's@< /dev/tty@< "$TEST_KEY_FILE"@g' > "$TMP/read-key.sh"
+  . "$TMP/read-key.sh"
+  TEST_KEY_FILE="$TMP/key-input"
+  for filter_mode in false true; do
+    for input in k j q A; do
+      printf '%s' "$input" > "$TEST_KEY_FILE"
+      read_key || fail "read key $input"
+      if [ "$filter_mode" = true ]; then
+        [ "$KEY" = char ] && [ "$KEY_TEXT" = "$input" ] || fail "search must accept $input"
+      else
+        case "$input" in k) expected=up ;; j) expected=down ;; q) expected=quit ;; A) expected=all ;; esac
+        [ "$KEY" = "$expected" ] || fail "normal shortcut $input"
+      fi
+    done
+    for mapping in '020 up' '016 down' '177 backspace' '010 backspace' '012 enter' '040 space' '057 filter'; do
+      code=${mapping% *}; expected=${mapping#* }
+      printf '%b' "\\$code" > "$TEST_KEY_FILE"
+      read_key || fail "read control key $code"
+      [ "$KEY" = "$expected" ] || fail "control key $code in filter_mode=$filter_mode"
+    done
+  done
+)
+
 output=$("$ROOT/bin/mmonitctl" stop-all --yes)
 printf '%s' "$output" | grep -F '2 hosts updated, 1 skipped.' >/dev/null || fail "stop-all output"
 [ "$(wc -l < "$MOCK_LOG" | tr -d ' ')" = "2" ] || fail "stop-all request count"
