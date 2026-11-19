@@ -147,7 +147,7 @@ These commands change notification rule activity; host monitoring and rule condi
 
 ## API usage
 
-- `GET /api/2/session/get` (CSRF token)
+- `GET /api/2/session/get` (session initialization; CSRF token on older versions)
 - `GET /api/2/admin/hosts/list`
 - `GET /api/2/admin/hosts/get?id=<id>`
 - `POST /api/2/admin/hosts/update`
@@ -159,9 +159,17 @@ These commands change notification rule activity; host monitoring and rule condi
 
 The alert endpoints are used by the M/Monit admin UI and are not documented in
 the public HTTP API. Check compatibility when upgrading M/Monit. Updates use
-the session CSRF token and its session cookie with the existing Basic authentication settings.
+the session cookie with the existing Basic authentication settings, plus the CSRF
+token when returned by older versions. M/Monit 4.4.0's tokenless `{}` response is supported.
+
+Every API command initializes a session, including `status` and `health`. Host lists
+use `startindex` and `results` pagination and follow `totalRecords` even when the
+server limits the page size. Incomplete pages fail before bulk updates begin.
+Successful updates may return an empty HTTP 200 body.
 
 For `hosts/update`, values from `hosts/get` are preserved and sent together with `status`.
+This includes the `........` password placeholder returned by M/Monit 4.4.0,
+which preserves the stored password.
 
 ## Development
 

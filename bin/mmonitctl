@@ -179,6 +179,9 @@ api_request() {
   if [ -n "$SESSION_COOKIE" ]; then
     set -- --cookie "$SESSION_COOKIE" "$@"
   fi
+  if [ "$method" = POST ] && [ -n "$CSRF_TOKEN" ]; then
+    set -- --header "X-CSRF-Token: $CSRF_TOKEN" --header "CSRFToken: $CSRF_TOKEN" "$@"
+  fi
 
   status=$(curl --silent --show-error --compressed \
     --output "$response" --write-out '%{http_code}' \
@@ -202,18 +205,19 @@ api_request() {
   esac
 }
 
-fetch_csrf_token() {
+initialize_session() {
   SESSION_COOKIE=$(new_temp) || return 1
-  # Keep one session for the token and all workers. Only this request writes
+  # Keep one session for all commands and workers. Only this request writes
   # the cookie jar; parallel updates read it without modifying it.
   TMP_FILES="$TMP_FILES $SESSION_COOKIE"
   json=$(new_temp) || return 1
   api_request GET /api/2/session/get --cookie-jar "$SESSION_COOKIE" > "$json" || return 1
-  CSRF_TOKEN=$(jq -r '.CSRFToken // empty' "$json")
-  if [ -z "$CSRF_TOKEN" ]; then
-    error "Could not get CSRF token from /api/2/session/get"
+  if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$json" >/dev/null 2>&1; then
+    error "Could not parse session response"
     return 1
   fi
+  # M/Monit 4.4.0 returns {}. Older versions still require the session token.
+  CSRF_TOKEN=$(jq -r '.CSRFToken // empty' "$json")
 }
 
 fetch_records_all() {
@@ -229,7 +233,7 @@ fetch_records_all() {
 
   while :; do
     page=$(new_temp) || return 1
-    api_request GET "${endpoint_base}?startIndex=${start}&pageSize=${page_size}" > "$page" || return 1
+    api_request GET "${endpoint_base}?startindex=${start}&results=${page_size}" > "$page" || return 1
 
     if ! jq -e '.records | type == "array"' >/dev/null 2>&1 < "$page"; then
       error "Could not parse paged response: $endpoint_base"
@@ -237,10 +241,6 @@ fetch_records_all() {
     fi
 
     page_count=$(jq '.records | length' "$page")
-    if [ "$page_count" -eq 0 ]; then
-      break
-    fi
-
     next=$(new_temp) || return 1
     if ! jq --slurpfile p "$page" '.records += ($p[0].records // [])' "$merged" > "$next"; then
       error "Could not merge paged response: $endpoint_base"
@@ -265,12 +265,16 @@ fetch_records_all() {
       break
     fi
 
-    if [ "$unique_count" -le "$prev_unique" ]; then
+    if [ "$page_count" -eq 0 ] || [ "$unique_count" -le "$prev_unique" ]; then
+      if [ -n "$total_hint" ]; then
+        error "Incomplete paged response: $endpoint_base ($unique_count/$total_hint records)"
+        return 1
+      fi
       break
     fi
     prev_unique=$unique_count
 
-    if [ "$page_count" -lt "$page_size" ]; then
+    if [ -z "$total_hint" ] && [ "$page_count" -lt "$page_size" ]; then
       break
     fi
 
@@ -445,8 +449,6 @@ update_host_status() {
   description=${10}
 
   api_request POST /api/2/admin/hosts/update \
-    --header "X-CSRF-Token: $CSRF_TOKEN" \
-    --header "CSRFToken: $CSRF_TOKEN" \
     --data-urlencode "id=$id" \
     --data-urlencode "hostname=$hostname" \
     --data-urlencode "monituser=$monituser" \
@@ -615,8 +617,6 @@ run_alert_job() {
   if [ "$current" = "$target_active" ]; then
     printf '%s\t%s\t%s\n' "$index" skipped "$label" > "$result_dir/$index"
   elif api_request POST /admin/alerts/updateactive \
-    --header "X-CSRF-Token: $CSRF_TOKEN" \
-    --header "CSRFToken: $CSRF_TOKEN" \
     --data-urlencode "id=$id" --data-urlencode "active=$target_active" >/dev/null; then
     printf '%s\t%s\t%s\n' "$index" ok "$label" > "$result_dir/$index"
   else
@@ -1436,11 +1436,7 @@ main() {
       ;;
   esac
 
-  case "$command" in
-    stop-all|start-all|stop|start|stop-group|start-group|stop-select|start-select|alerts-off-all|alerts-on-all|alerts-off|alerts-on)
-      fetch_csrf_token || return 1
-      ;;
-  esac
+  initialize_session || return 1
 
   case "$command" in
     alerts-off-all) run_alerts_action 0 false ;;

@@ -64,6 +64,25 @@ done
 status=200
 body='{}'
 
+# Every API command must initialize a session before reading or updating.
+case "$url" in
+  *"/api/2/session/get") ;;
+  *)
+    if [ -z "$cookie_file" ] || ! grep -F 'zsessionid' "$cookie_file" >/dev/null 2>&1; then
+      printf '%s' '{"error":"session cookie required"}' > "$output"
+      printf '500'
+      exit 0
+    fi
+    ;;
+esac
+if [ "$method" = POST ]; then
+  if [ "${MOCK_V44:-0}" = 1 ]; then
+    [ -z "$csrf" ] || exit 1
+  else
+    [ "$csrf" = 'CSRFToken: token-123' ] || exit 1
+  fi
+fi
+
 case "$url" in
   *"/admin/alerts/list")
     if [ "${MOCK_ALERT_INVALID:-0}" = 1 ]; then
@@ -78,7 +97,7 @@ case "$url" in
     fi
     ;;
   *"/admin/alerts/updateactive")
-    [ "$method" = POST ] && [ "$csrf" = 'CSRFToken: token-123' ] || exit 1
+    [ "$method" = POST ] || exit 1
     if [ -z "$cookie_file" ] || ! grep -F 'zsessionid' "$cookie_file" >/dev/null 2>&1; then
       status=403; body='{"error":"session cookie required"}'
       printf '%s' "$body" > "$output"
@@ -103,6 +122,9 @@ case "$url" in
     ;;
   *"/api/2/session/get")
     body='{"CSRFToken":"token-123"}'
+    [ "${MOCK_V44:-0}" != 1 ] || body='{}'
+    [ "${MOCK_SESSION_INVALID:-0}" != 1 ] || body='not-json'
+    [ "${MOCK_SESSION_DENIED:-0}" != 1 ] || { status=401; body='{"error":"unauthorized"}'; }
     ;;
   *"/api/2/reports/events/list?active=1&state=1")
     if [ "${MOCK_CHECK_FAIL:-0}" = "1" ]; then
@@ -116,6 +138,19 @@ case "$url" in
       body='{"totalRecords":3,"records":[{"id":1,"hostname":"host-a","status":"Active"},{"id":2,"hostname":"host-b","status":"Active"},{"id":3,"hostname":"host-c","status":"Active"}]}'
     else
       body='{"totalRecords":3,"records":[{"id":1,"hostname":"host-a","status":"Active"},{"id":2,"hostname":"host-b","status":"Active"},{"id":3,"hostname":"host-c","status":"Inactive"}]}'
+    fi
+    if [ "${MOCK_V44:-0}" = 1 ]; then
+      case "$url" in
+        *'?startindex='*'&results=200') ;;
+        *) exit 1 ;;
+      esac
+      offset=${url#*startindex=}; offset=${offset%%&*}
+      [ "${MOCK_PAGE_REPEAT:-0}" != 1 ] || offset=0
+      body=$(printf '%s' "$body" | jq --argjson offset "$offset" \
+        '.records = .records[$offset:($offset + 2)] | .pageSize = 2 | .startIndex = $offset | .recordsReturned = (.records|length)')
+      if [ "${MOCK_PAGE_EMPTY:-0}" = 1 ] && [ "$offset" -gt 0 ]; then
+        body='{"totalRecords":3,"records":[]}'
+      fi
     fi
     ;;
   *"/api/2/admin/groups/list")
@@ -139,6 +174,19 @@ case "$url" in
     body='{"error":"not found"}'
     ;;
 esac
+
+if [ "${MOCK_V44:-0}" = 1 ]; then
+  case "$url" in
+    *"/api/2/admin/hosts/get?id="*)
+      body=$(printf '%s' "$body" | jq '.monitpassword = "........"')
+      ;;
+    *"/api/2/admin/hosts/update")
+      case "$data" in *'monitpassword=........&'*) ;; *) exit 1 ;; esac
+      ;;
+  esac
+  # 4.4.0 updates succeed with an empty response body.
+  [ "$method" != POST ] || [ "$status" != 200 ] || body=''
+fi
 
 if [ -n "$cookie_jar" ]; then
   printf '#HttpOnly_mmonit\tTRUE\t/\tFALSE\t0\tzsessionid\tmock\n' > "$cookie_jar"
@@ -285,6 +333,41 @@ fi
 if ! MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" health --invert-exit >/dev/null 2>&1; then
   fail "health --invert-exit should succeed when host is red/orange"
 fi
+
+# M/Monit 4.4.0: tokenless sessions, clamped pages, password sentinel,
+# empty update bodies, and all group name/ID combinations.
+export MOCK_V44=1
+for action in stop-all start-all 'stop-group web' 'stop-group 10' 'start-group web' 'start-group 10'; do
+  : > "$MOCK_LOG"
+  output=$("$ROOT/bin/mmonitctl" $action) || fail "4.4.0 $action"
+  case "$action" in
+    stop-all) expected_count=2; expected_status=2 ;;
+    stop-group*) expected_count=1; expected_status=2 ;;
+    *) expected_count=1; expected_status=0 ;;
+  esac
+  [ "$(wc -l < "$MOCK_LOG" | tr -d ' ')" = "$expected_count" ] || fail "4.4.0 $action count"
+  grep -F "status=$expected_status" "$MOCK_LOG" >/dev/null || fail "4.4.0 $action status"
+  grep -F 'monitpassword=........' "$MOCK_LOG" >/dev/null || fail "4.4.0 password sentinel"
+done
+output=$("$ROOT/bin/mmonitctl" status 2>&1) && fail "4.4.0 status must include inactive host on second page"
+printf '%s' "$output" | grep -F '(2/3 Active)' >/dev/null || fail "4.4.0 status pagination"
+MOCK_HOSTS_ACTIVE=1 "$ROOT/bin/mmonitctl" status >/dev/null || fail "4.4.0 active status"
+"$ROOT/bin/mmonitctl" health >/dev/null || fail "4.4.0 health session"
+if MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" health >/dev/null 2>&1; then fail "4.4.0 health errors"; fi
+for paging_failure in MOCK_PAGE_REPEAT MOCK_PAGE_EMPTY; do
+  : > "$MOCK_LOG"
+  if env "$paging_failure=1" "$ROOT/bin/mmonitctl" stop-all >/dev/null 2>&1; then fail "4.4.0 incomplete paging $paging_failure"; fi
+  [ ! -s "$MOCK_LOG" ] || fail "incomplete pages must not update hosts"
+done
+for session_failure in MOCK_SESSION_INVALID MOCK_SESSION_DENIED; do
+  : > "$MOCK_LOG"
+  if env "$session_failure=1" "$ROOT/bin/mmonitctl" stop-all >/dev/null 2>&1; then fail "invalid session $session_failure"; fi
+  [ ! -s "$MOCK_LOG" ] || fail "invalid session must not update hosts"
+done
+"$ROOT/bin/mmonitctl" alerts-off-all >/dev/null || fail "4.4.0 alerts off"
+"$ROOT/bin/mmonitctl" alerts-on-all >/dev/null || fail "4.4.0 alerts on"
+if MOCK_ALERT_FAIL=1 "$ROOT/bin/mmonitctl" alerts-off-all >/dev/null 2>&1; then fail "4.4.0 alert HTTP failure"; fi
+unset MOCK_V44
 
 "$ROOT/bin/mmonitctl" --version | grep -F 'mmonitctl 0.1.0' >/dev/null || fail "version"
 "$ROOT/bin/mmonitctl" --help | grep -F 'mmonitctl stop-group <group>' >/dev/null || fail "help stop-group"

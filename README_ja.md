@@ -146,7 +146,7 @@ Spaceで対象を選択、Enterで実行します。変更が必要なルール�
 
 ## API利用
 
-- `GET /api/2/session/get`（CSRFトークン）
+- `GET /api/2/session/get`（セッション初期化。旧バージョンではCSRFトークンも取得）
 - `GET /api/2/admin/hosts/list`
 - `GET /api/2/admin/hosts/get?id=<id>`
 - `POST /api/2/admin/hosts/update`
@@ -157,9 +157,12 @@ Spaceで対象を選択、Enterで実行します。変更が必要なルール�
 - `POST /admin/alerts/updateactive`（`id`、Onは`active=1`、Offは`active=0`）
 
 アラート用の経路はM/Monit管理画面が使用しているもので、公開HTTP API資料には記載されていません。
-M/Monitの更新時には互換性を確認してください。更新にはセッションのCSRFトークン・Cookieと既存のBasic認証設定を使用します。
+M/Monitの更新時には互換性を確認してください。更新にはセッションのCookieと既存のBasic認証設定を使用し、旧バージョンがCSRFトークンを返す場合はヘッダにも付与します。4.4.0のトークンなし応答 `{}` にも対応しています。
+
+`status`・`health` を含む全APIコマンドで、最初にセッションを初期化します。ホスト一覧は `startindex`・`results` でページを指定し、サーバーがページサイズを制限しても `totalRecords` の全件を取得するまで継続します。不完全な一覧では一括更新を開始せずエラーにします。更新成功時のHTTP 200・空ボディも受け付けます。
 
 `hosts/update` では、`hosts/get` で取得した値を `status` と一緒に引き継いで送信します。
+4.4.0が返すパスワードの予約値 `........` もそのまま再送し、保存済みパスワードを保持します。
 
 ## 開発
 
