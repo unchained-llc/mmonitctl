@@ -25,12 +25,53 @@ info() { printf '%s›%s %s\n' "$CYAN" "$RESET" "$*"; }
 print_logo() { printf '%s%s◆ M/Monit%s  %shost monitor control%s\n' "$BOLD" "$GREEN" "$RESET" "$DIM" "$RESET"; }
 
 cleanup() {
+  cleanup_status=${1:-0}
+  trap - 0
+  trap '' HUP INT TERM
+  # Workers share this session: finish them before invalidating it.
+  wait
+  if [ -n "$SESSION_COOKIE" ] && [ -r "$SESSION_COOKIE" ] &&
+      awk '$6 ~ /^(__Secure-|__Host-)?zsessionid$/ && $7 != "" { found=1 } END { exit !found }' "$SESSION_COOKIE"; then
+    set --
+    if [ -n "$CSRF_TOKEN" ]; then
+      set -- --header "X-CSRF-Token: $CSRF_TOKEN" --header "CSRFToken: $CSRF_TOKEN"
+    fi
+    logout_headers=$(new_temp)
+    TMP_FILES="$TMP_FILES $logout_headers"
+    # Do not retry logout or write a new cookie jar. Bound exit-time network I/O.
+    logout_status=$(curl --silent --show-error --compressed \
+      --connect-timeout 3 --max-time 5 \
+      --dump-header "$logout_headers" \
+      --output /dev/null --write-out '%{http_code}' --request POST \
+      --user "$USERNAME:$PASSWORD" --cookie "$SESSION_COOKIE" "$@" \
+      "$BASE_URL/api/2/session/invalidate") || logout_status=000
+    # M/Monit can redirect to its root after successfully logging out.
+    # Do not follow it: that could create another session or enter SSO.
+    if [ "$logout_status" = 302 ]; then
+      logout_location=$(awk 'tolower($1) == "location:" {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); location=$0} END {print location}' "$logout_headers")
+      case "$logout_location" in
+        /|"$BASE_URL/") logout_status=200 ;;
+      esac
+    fi
+    case "$logout_status" in
+      2??) ;;
+      *)
+        error "Could not invalidate M/Monit session ($logout_status)"
+        [ "$cleanup_status" -ne 0 ] || cleanup_status=1
+        ;;
+    esac
+  fi
+  SESSION_COOKIE=""
   if [ -n "$TMP_FILES" ]; then
     # shellcheck disable=SC2086
     rm -rf $TMP_FILES
   fi
+  exit "$cleanup_status"
 }
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup "$?"' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 new_temp() {
   file=$(mktemp "${TMPDIR:-/tmp}/mmonitctl.XXXXXX") || return 1
@@ -530,9 +571,9 @@ bulk_update_from_file() {
     [ -n "$id" ] || continue
     index=$((index + 1))
     if [ "$resource" = alerts ]; then
-      run_alert_job "$id" "$target_status" "$result_dir" "$index" "$hostname" "$current" &
+      (trap - 0 HUP INT TERM; run_alert_job "$id" "$target_status" "$result_dir" "$index" "$hostname" "$current") &
     else
-      run_host_job "$id" "$target_status" "$result_dir" "$index" "$hostname" &
+      (trap - 0 HUP INT TERM; run_host_job "$id" "$target_status" "$result_dir" "$index" "$hostname") &
     fi
     running=$((running + 1))
     if [ "$running" -ge "$CONCURRENCY" ]; then

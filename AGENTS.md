@@ -27,6 +27,7 @@
 - `status=1` は Inactive であり、監視停止意図とは異なるため停止コマンドでは使わない
 - `POST /api/2/admin/hosts/update` 時は、`hosts/get` の詳細値を引き継いで送る
 - 全APIコマンドで最初に `GET /api/2/session/get` を呼び、取得したCookieを後続リクエストで共有する
+- 終了時は `POST /api/2/session/invalidate` で自身のセッションを破棄する。エラー・シグナル終了でも、並列ワーカーの完了後に親プロセスが1回だけ破棄する
 - 旧バージョンが返す `CSRFToken` は更新時ヘッダに付与する。4.4.0以降のトークンなし応答 `{}` も正常として扱う
 - ホスト一覧のページ指定は `startindex` / `results` を使い、`totalRecords` がある場合は全件取得するまで継続する。不完全な一覧で一括更新しない
 - 4.4.0の `monitpassword` の予約値 `........` は変更せず再送し、保存済みパスワードを保持する

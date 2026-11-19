@@ -148,6 +148,7 @@ These commands change notification rule activity; host monitoring and rule condi
 ## API usage
 
 - `GET /api/2/session/get` (session initialization; CSRF token on older versions)
+- `POST /api/2/session/invalidate` (release this command's session on exit)
 - `GET /api/2/admin/hosts/list`
 - `GET /api/2/admin/hosts/get?id=<id>`
 - `POST /api/2/admin/hosts/update`
@@ -166,6 +167,14 @@ Every API command initializes a session, including `status` and `health`. Host l
 use `startindex` and `results` pagination and follow `totalRecords` even when the
 server limits the page size. Incomplete pages fail before bulk updates begin.
 Successful updates may return an empty HTTP 200 body.
+
+On normal exit, errors, or HUP/INT/TERM, the CLI waits for its workers and
+invalidates its own session before deleting the cookie file. Repeated polling
+does not leave sessions waiting for the server timeout. Logout has a five-second
+timeout; a logout failure is reported and turns a successful exit into a failure.
+Both `zsessionid` and its `__Secure-` / `__Host-` variants are recognized.
+A successful logout may return HTTP 200 or HTTP 302 to the configured server
+root. The CLI accepts that root redirect without following it or entering SSO.
 
 For `hosts/update`, values from `hosts/get` are preserved and sent together with `status`.
 This includes the `........` password placeholder returned by M/Monit 4.4.0,

@@ -17,6 +17,7 @@ write_out=""
 cookie_jar=""
 cookie_file=""
 csrf=""
+header_file=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -47,6 +48,13 @@ while [ "$#" -gt 0 ]; do
     --user|-u)
       shift 2
       ;;
+    --connect-timeout|--max-time)
+      shift 2
+      ;;
+    --dump-header)
+      header_file=$2
+      shift 2
+      ;;
     --header|-H)
       case "$2" in CSRFToken:*) csrf=$2 ;; esac
       shift 2
@@ -63,6 +71,7 @@ done
 
 status=200
 body='{}'
+printf '%s %s\n' "$method" "${url#https://mock.invalid}" >> "$MOCK_CALL_LOG"
 
 # Every API command must initialize a session before reading or updating.
 case "$url" in
@@ -73,6 +82,8 @@ case "$url" in
       printf '500'
       exit 0
     fi
+    session_id=$(awk '$6 ~ /^(__Secure-|__Host-)?zsessionid$/ {print $7}' "$cookie_file")
+    [ -f "$MOCK_SESSION_STATE/$session_id" ] || exit 1
     ;;
 esac
 if [ "$method" = POST ]; then
@@ -125,6 +136,21 @@ case "$url" in
     [ "${MOCK_V44:-0}" != 1 ] || body='{}'
     [ "${MOCK_SESSION_INVALID:-0}" != 1 ] || body='not-json'
     [ "${MOCK_SESSION_DENIED:-0}" != 1 ] || { status=401; body='{"error":"unauthorized"}'; }
+    ;;
+  *"/api/2/session/invalidate")
+    [ "$method" = POST ] || exit 1
+    session_id=$(awk '$6 ~ /^(__Secure-|__Host-)?zsessionid$/ {print $7}' "$cookie_file")
+    [ -f "$MOCK_SESSION_STATE/$session_id" ] || exit 1
+    if [ "${MOCK_LOGOUT_FAIL:-0}" = 1 ]; then
+      status=500; body='{"error":"logout failed"}'
+    else
+      rm "$MOCK_SESSION_STATE/$session_id"
+      body=''
+      if [ "${MOCK_V44:-0}" = 1 ]; then
+        status=302
+        printf 'HTTP/1.1 302 Found\r\nLocation: %s\r\n' "${MOCK_LOGOUT_LOCATION:-https://mock.invalid/}" > "$header_file"
+      fi
+    fi
     ;;
   *"/api/2/reports/events/list?active=1&state=1")
     if [ "${MOCK_CHECK_FAIL:-0}" = "1" ]; then
@@ -189,7 +215,13 @@ if [ "${MOCK_V44:-0}" = 1 ]; then
 fi
 
 if [ -n "$cookie_jar" ]; then
-  printf '#HttpOnly_mmonit\tTRUE\t/\tFALSE\t0\tzsessionid\tmock\n' > "$cookie_jar"
+  if [ "$status" = 200 ]; then
+    session_id=${cookie_jar##*/}
+    cookie_name=${MOCK_COOKIE_NAME:-zsessionid}
+    [ "${MOCK_V44:-0}" != 1 ] || cookie_name=${MOCK_COOKIE_NAME:-__Secure-zsessionid}
+    printf '#HttpOnly_mmonit\tTRUE\t/\tFALSE\t0\t%s\t%s\n' "$cookie_name" "$session_id" > "$cookie_jar"
+    : > "$MOCK_SESSION_STATE/$session_id"
+  fi
 fi
 
 if [ -n "$output" ]; then
@@ -206,6 +238,8 @@ chmod +x "$TMP/mockbin/curl"
 
 export PATH="$TMP/mockbin:$PATH"
 export MOCK_LOG="$TMP/requests.log"
+export MOCK_CALL_LOG="$TMP/calls.log" MOCK_SESSION_STATE="$TMP/sessions"
+mkdir -p "$MOCK_SESSION_STATE"
 export MMONIT_BASE_URL="https://mock.invalid"
 export MMONIT_USERNAME="admin"
 export MMONIT_PASSWORD="secret"
@@ -367,6 +401,68 @@ done
 "$ROOT/bin/mmonitctl" alerts-off-all >/dev/null || fail "4.4.0 alerts off"
 "$ROOT/bin/mmonitctl" alerts-on-all >/dev/null || fail "4.4.0 alerts on"
 if MOCK_ALERT_FAIL=1 "$ROOT/bin/mmonitctl" alerts-off-all >/dev/null 2>&1; then fail "4.4.0 alert HTTP failure"; fi
+unset MOCK_V44
+
+# Every completed command owns and invalidates exactly one session. This also
+# checks that parallel workers never invalidate the parent's shared session.
+[ -z "$(ls -A "$MOCK_SESSION_STATE")" ] || fail "earlier commands leaked sessions"
+for server_version in 0 1; do
+  export MOCK_V44=$server_version
+  for action in health status stop-all start-all 'stop-group web' 'start-group 10' alerts-off-all; do
+    : > "$MOCK_CALL_LOG"
+    command_rc=0
+    "$ROOT/bin/mmonitctl" $action >/dev/null 2>&1 || command_rc=$?
+    case "$action" in status) expected_rc=1 ;; *) expected_rc=0 ;; esac
+    [ "$command_rc" = "$expected_rc" ] || fail "session cleanup changed $action exit code"
+    [ "$(grep -c '^GET /api/2/session/get$' "$MOCK_CALL_LOG")" = 1 ] || fail "session initialization count"
+    [ "$(grep -c '^POST /api/2/session/invalidate$' "$MOCK_CALL_LOG")" = 1 ] || fail "session invalidation count"
+    [ "$(tail -1 "$MOCK_CALL_LOG")" = 'POST /api/2/session/invalidate' ] || fail "logout ran before command finished"
+    [ -z "$(ls -A "$MOCK_SESSION_STATE")" ] || fail "$action leaked sessions"
+  done
+  for iteration in 1 2 3 4 5; do
+    "$ROOT/bin/mmonitctl" health >/dev/null || fail "repeated health"
+  done
+  [ -z "$(ls -A "$MOCK_SESSION_STATE")" ] || fail "repeated health leaked sessions"
+  if MOCK_CHECK_FAIL=1 "$ROOT/bin/mmonitctl" health >/dev/null 2>&1; then fail "cleanup changed health error"; fi
+  if "$ROOT/bin/mmonitctl" health --invert-exit >/dev/null 2>&1; then fail "cleanup changed inverted health"; fi
+  [ -z "$(ls -A "$MOCK_SESSION_STATE")" ] || fail "health errors leaked sessions"
+done
+
+cat > "$TMP/interrupted.sh" <<'EOF'
+#!/bin/sh
+. "$TEST_FUNCTIONS"
+load_config || exit 1
+initialize_session || exit 1
+(
+  trap - 0 HUP INT TERM
+  sleep 1
+  api_request GET /api/2/admin/hosts/get?id=1 >/dev/null && : > "$TEST_WORKER_DONE"
+) &
+kill -s "$TEST_SIGNAL" "$$"
+exit 99
+EOF
+# Refresh the sourced functions after any implementation changes.
+sed '$d' "$ROOT/bin/mmonitctl" > "$TEST_FUNCTIONS"
+export TEST_WORKER_DONE="$TMP/worker-done"
+for signal_case in 'HUP 129' 'INT 130' 'TERM 143'; do
+  export TEST_SIGNAL=${signal_case% *}
+  expected_rc=${signal_case#* }
+  rm -f "$TEST_WORKER_DONE"
+  command_rc=0
+  sh "$TMP/interrupted.sh" >/dev/null 2>&1 || command_rc=$?
+  [ "$command_rc" = "$expected_rc" ] || fail "$TEST_SIGNAL exit code"
+  [ -f "$TEST_WORKER_DONE" ] || fail "$TEST_SIGNAL invalidated a running worker's session"
+  [ -z "$(ls -A "$MOCK_SESSION_STATE")" ] || fail "$TEST_SIGNAL leaked sessions"
+done
+if MOCK_LOGOUT_FAIL=1 "$ROOT/bin/mmonitctl" health >"$TMP/logout-failure" 2>&1; then fail "logout failure must fail command"; fi
+grep -F 'Could not invalidate M/Monit session (500)' "$TMP/logout-failure" >/dev/null || fail "logout error not reported"
+rm -f "$MOCK_SESSION_STATE/"*
+MOCK_COOKIE_NAME=__Host-zsessionid "$ROOT/bin/mmonitctl" health >/dev/null || fail "host-prefixed session cookie"
+MOCK_LOGOUT_LOCATION=/ "$ROOT/bin/mmonitctl" health >/dev/null || fail "relative logout redirect"
+if MOCK_LOGOUT_LOCATION=https://sso.invalid/login "$ROOT/bin/mmonitctl" health >/dev/null 2>&1; then fail "SSO redirect must not count as logout success"; fi
+: > "$MOCK_CALL_LOG"
+if MOCK_SESSION_DENIED=1 "$ROOT/bin/mmonitctl" health >/dev/null 2>&1; then fail "denied session"; fi
+if grep -q 'session/invalidate' "$MOCK_CALL_LOG"; then fail "must not logout without a session cookie"; fi
 unset MOCK_V44
 
 "$ROOT/bin/mmonitctl" --version | grep -F 'mmonitctl 0.1.0' >/dev/null || fail "version"
