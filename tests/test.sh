@@ -252,6 +252,17 @@ fail() {
   exit 1
 }
 
+# Keep CLI temporary files separate from fixtures, including a path with spaces.
+export TMPDIR="$TMP/temp files"
+mkdir -p "$TMPDIR"
+assert_no_temp_files() {
+  [ -z "$(ls -A "$TMPDIR")" ] || fail "CLI left temporary files behind"
+}
+for iteration in 1 2 3; do
+  "$ROOT/bin/mmonitctl" health >/dev/null || fail "repeated health"
+  assert_no_temp_files
+done
+
 # Exercise the actual key decoder with file input instead of a terminal.
 (
   awk '/^read_key\(\) \{/ { copying=1 } copying { print } copying && /^\}/ { exit }' \
@@ -453,6 +464,7 @@ for signal_case in 'HUP 129' 'INT 130' 'TERM 143'; do
   [ "$command_rc" = "$expected_rc" ] || fail "$TEST_SIGNAL exit code"
   [ -f "$TEST_WORKER_DONE" ] || fail "$TEST_SIGNAL invalidated a running worker's session"
   [ -z "$(ls -A "$MOCK_SESSION_STATE")" ] || fail "$TEST_SIGNAL leaked sessions"
+  assert_no_temp_files
 done
 if MOCK_LOGOUT_FAIL=1 "$ROOT/bin/mmonitctl" health >"$TMP/logout-failure" 2>&1; then fail "logout failure must fail command"; fi
 grep -F 'Could not invalidate M/Monit session (500)' "$TMP/logout-failure" >/dev/null || fail "logout error not reported"
@@ -482,4 +494,19 @@ fi
 "$ROOT/bin/mmonitctl" --help | grep -F 'mmonitctl status' >/dev/null || fail "help status"
 "$ROOT/bin/mmonitctl" --help | grep -F -- '--invert-exit' >/dev/null || fail "help invert-exit"
 
+# Concurrent invocations must remove only their own directory.
+printf 'keep\n' > "$TMPDIR/unrelated"
+"$ROOT/bin/mmonitctl" health >/dev/null &
+first_pid=$!
+"$ROOT/bin/mmonitctl" health >/dev/null &
+second_pid=$!
+wait "$first_pid" || fail "first concurrent health"
+wait "$second_pid" || fail "second concurrent health"
+[ "$(cat "$TMPDIR/unrelated")" = keep ] || fail "removed unrelated temporary file"
+rm "$TMPDIR/unrelated"
+assert_no_temp_files
+if TMPDIR="$TMP/missing" "$ROOT/bin/mmonitctl" health >/dev/null 2>&1; then
+  fail "temporary directory creation failure must fail the command"
+fi
+assert_no_temp_files
 printf 'OK\n'

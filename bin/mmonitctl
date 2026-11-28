@@ -6,7 +6,7 @@ VERSION="0.1.0"
 CONCURRENCY="${MMONIT_CONCURRENCY:-8}"
 ASSUME_YES=false
 INVERT_EXIT=false
-TMP_FILES=""
+TMP_DIR=""
 CSRF_TOKEN=""
 SESSION_COOKIE=""
 
@@ -37,7 +37,6 @@ cleanup() {
       set -- --header "X-CSRF-Token: $CSRF_TOKEN" --header "CSRFToken: $CSRF_TOKEN"
     fi
     logout_headers=$(new_temp)
-    TMP_FILES="$TMP_FILES $logout_headers"
     # Do not retry logout or write a new cookie jar. Bound exit-time network I/O.
     logout_status=$(curl --silent --show-error --compressed \
       --connect-timeout 3 --max-time 5 \
@@ -62,9 +61,8 @@ cleanup() {
     esac
   fi
   SESSION_COOKIE=""
-  if [ -n "$TMP_FILES" ]; then
-    # shellcheck disable=SC2086
-    rm -rf $TMP_FILES
+  if [ -n "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
   fi
   exit "$cleanup_status"
 }
@@ -73,10 +71,15 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+initialize_temp_dir() {
+  [ -z "$TMP_DIR" ] || return 0
+  # Initialize in the parent so command substitutions and workers share it.
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mmonitctl.XXXXXX")
+}
+
 new_temp() {
-  file=$(mktemp "${TMPDIR:-/tmp}/mmonitctl.XXXXXX") || return 1
-  TMP_FILES="$TMP_FILES $file"
-  printf '%s' "$file"
+  [ -n "$TMP_DIR" ] || return 1
+  mktemp "$TMP_DIR/tmp.XXXXXX"
 }
 
 normalize_base_url() {
@@ -247,10 +250,10 @@ api_request() {
 }
 
 initialize_session() {
+  initialize_temp_dir || return 1
   SESSION_COOKIE=$(new_temp) || return 1
   # Keep one session for all commands and workers. Only this request writes
   # the cookie jar; parallel updates read it without modifying it.
-  TMP_FILES="$TMP_FILES $SESSION_COOKIE"
   json=$(new_temp) || return 1
   api_request GET /api/2/session/get --cookie-jar "$SESSION_COOKIE" > "$json" || return 1
   if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$json" >/dev/null 2>&1; then
